@@ -1,0 +1,33 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Dependencies
+node_modules
+.pnpm-store
+
+# Production build
+dist
+dist-ssr
+
+# Environment / Local settings
+.env.local
+.env.*.local
+*.local
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# 各游戏目录和游戏文件
+*.bin
+*.kairo.bin
+public/cartridges/*
+!public/cartridges/.gitkeep
+!public/cartridges/manifest.json

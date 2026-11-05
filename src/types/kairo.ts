@@ -6,26 +6,86 @@ export interface CartridgeManifestItem {
   hasBin?: boolean;
 }
 
+export interface UniversalBuildItem {
+  id: number;
+  name: string;
+  category: number;
+  price: number;
+  upkeep: number;
+  charge: number;
+  popularity: number;
+  scenery: number;
+  w: number;
+  h: number;
+  desc: string;
+  imgKey: string;
+  sprite?: {
+    seb: string;
+    img: string;
+    sx: number;
+    sy: number;
+    sw: number;
+    sh: number;
+    ox: number;
+    oy: number;
+  } | null;
+}
+
+export interface UniversalSpecialItem {
+  id: number;
+  name: string;
+  cost: number;
+  power: number;
+  income: number;
+  imgKey: string;
+  desc: string;
+}
+
+export interface UniversalRouteOrProduct {
+  id: number;
+  name: string;
+  city: string;
+  cost: number;
+  reward: number;
+  desc: string;
+}
+
+export interface UniversalChallengeItem {
+  id: number;
+  name: string;
+  cost: number;
+  reward: number;
+  desc: string;
+}
+
+export interface UniversalGameData {
+  buildItems: UniversalBuildItem[];
+  specialItems: UniversalSpecialItem[];
+  routesOrProducts: UniversalRouteOrProduct[];
+  challenges: UniversalChallengeItem[];
+  openingDialogs: string[];
+  manualPages: string[];
+  combos: string[];
+}
+
 export interface CartridgeBundle {
-  format?: string;
-  meta?: {
+  format: 'KAIRO_UNIVERSAL_DATA_V1' | string;
+  meta: {
     id: string;
     title: string;
     subtitle?: string;
     version?: string;
     resolution?: [number, number];
+    theme?: 'airport' | 'farm' | string;
+    categoryLabels?: string[];
+    specialMenuLabel?: string;
+    challengeMenuLabel?: string;
+    defaultCompanyName?: string;
+    secretaryName?: string;
   };
-  strings: Record<string, string>;
-  jpToSc: Record<string, string>;
-  methods: Record<string, any>;
-  methodSigs: Record<string, any>;
-  fields: Record<string, any>;
-  rvaBytes: Record<string, number[]>;
   pngDims: Record<string, [number, number, number]>;
-  comImgList: string[];
-  gameImgList: string[];
-  sebBytes: Record<string, number[]>;
   pngB64: Record<string, string>;
+  universalData: UniversalGameData;
 }
 
 export interface GameRuntimeMetadata {
@@ -53,18 +113,15 @@ export interface FastResumeSnapshot {
   vfsData?: {
     sysSave: string | null;
     slot0: string | null;
-    slot1: string | null;
   };
   engineSettings?: {
     simSpeed: number;
     audioEnabled: number | boolean;
-    useOriginalFund: boolean;
     isInfiniteFunds?: boolean;
   };
   vmState: {
     version: number;
-    roots: Record<string, any>;
-    heap: any[];
+    state: any;
   };
 }
 
@@ -77,6 +134,14 @@ export interface NativeSavePackage {
   files: {
     sysSave: string | null;
     slot0: string | null;
-    slot1: string | null;
   };
+}
+
+export interface TouchRegion {
+  type: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  param: number;
 }

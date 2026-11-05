@@ -1,5 +1,5 @@
 import React from 'react';
-import { FastResumeSnapshot, NativeSavePackage } from '../types/kairo';
+import { FastResumeSnapshot } from '../../types/kairo';
 
 interface SaveManagerModalProps {
   isOpen: boolean;
@@ -39,9 +39,7 @@ export const SaveManagerModal: React.FC<SaveManagerModalProps> = ({
         <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
           <div>
             <h3 className="text-lg font-extrabold text-amber-400">📂 存档管理</h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              当前游戏：{gameTitle}
-            </p>
+            <p className="text-xs text-slate-400 mt-0.5">当前游戏：{gameTitle}</p>
           </div>
           <button
             onClick={onClose}
@@ -52,7 +50,6 @@ export const SaveManagerModal: React.FC<SaveManagerModalProps> = ({
         </div>
 
         <div className="p-5 overflow-y-auto space-y-5">
-          {/* Action Toolbar */}
           <div className="flex flex-wrap gap-2.5">
             <button
               onClick={onCaptureManualSnapshot}
@@ -97,7 +94,6 @@ export const SaveManagerModal: React.FC<SaveManagerModalProps> = ({
             )}
           </div>
 
-          {/* Snapshot List */}
           <div className="space-y-3">
             {snapshots.length === 0 && (
               <div className="py-12 text-center text-slate-500 text-xs">
@@ -109,7 +105,6 @@ export const SaveManagerModal: React.FC<SaveManagerModalProps> = ({
                 key={snap.id}
                 className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800 flex flex-col gap-3 transition-colors hover:border-slate-700"
               >
-                {/* Item Top: Thumbnail + Info */}
                 <div className="flex items-center gap-3 w-full">
                   {snap.thumbnailDataUrl && (
                     <img
@@ -140,7 +135,6 @@ export const SaveManagerModal: React.FC<SaveManagerModalProps> = ({
                   </div>
                 </div>
 
-                {/* Item Bottom: 3 Action Buttons in a Single Row */}
                 <div className="grid grid-cols-3 gap-2 w-full pt-1">
                   <button
                     type="button"

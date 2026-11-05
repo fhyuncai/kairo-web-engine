@@ -1,492 +1,788 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-apk2cartridge.py — 开罗游戏 Android APK -> Web 卡带 (.kairo.bin) 转换工具
+apk2cartridge.py — 开罗游戏泛用型提取与 Web 卡带 (.bin) 转换工具
 =======================================================================
+支持输入格式：
+  1. 经典 Android Mono APK (含 Assembly-CSharp.dll + 7365637572697479... 资源包)
+  2. 现代 Android IL2CPP APK (含 assets/bin/Data/<hex> 拆分式 Unity TextAsset 资源)
+  3. PC / Steam 版压缩包 (.zip) 或游戏目录 (含 *_Data/resources.assets)
+
+核心能力：
+  - 自动探测输入包类型 (Mono CIL / Android IL2CPP / PC Steam IL2CPP)
+  - 自动提取 encrypt_key 或通过归档头结构方程零配置自动破解 4 字节 XOR 密钥
+  - 自动解包全部 Kairosoft .bytes 加密归档 (title, com, game, chip, body, map, xls, language 等)
+  - 自动解析 language_pack_template_ja 与 *_sc.csv / *_SC.csv，将全部 xls/*.txt 策划表编译为简体中文结构化数据
+  - 自动解析 img.inf 与 .seb 关键帧二进制数据，生成每个建筑/设施/作物/飞机的精确贴图裁剪表
+  - 输出符合项目规范的 public/cartridges/<game_id>/game.bin 与 manifest.json
+
 用法：
-  python3 tools/apk2cartridge.py <input.apk> --id <game_id> --title <游戏名> -o public/cartridges/<game_id>.kairo.bin
-
-转换流程：
-1. 解包 APK 内 assets/bin/Data/Managed/Assembly-CSharp.dll 与加密资源包
-2. 解密开罗 XOR 资源包中的 PNG 贴图集、img.inf、.seb 关键帧动画与 zh-CN 词典
-3. 解析 .NET Metadata 表与全部方法的 CIL 字节码指令集及异常处理表 (EH clauses)
-4. 输出经过 RFC-1951 Raw Deflate 压缩的标准化卡带文件 (<game_id>.kairo.bin)
+  python3 tools/apk2cartridge.py <input.apk|input.zip|input_dir> --id <game_id> [-o public/cartridges/<game_id>/game.bin]
 """
+import os
+import sys
+import re
+import glob
+import json
+import zlib
+import base64
+import struct
+import shutil
+import zipfile
+import tempfile
+import argparse
 
-import struct, json
 
-with open('/tmp/apk_extract/assets/bin/Data/Managed/Assembly-CSharp.dll', 'rb') as f:
-    data = f.read()
+def auto_recover_xor_key(encrypted_blobs):
+    for pref in ["title", "com", "game", "chip", "xls", "language"]:
+        if pref in encrypted_blobs:
+            data = encrypted_blobs[pref]
+            if len(data) >= 32 and not (data[0] == 0 and data[1] == 0):
+                k0, k1, k2 = data[8], data[9], data[10]
+                for k3 in range(256):
+                    key = bytes([k0, k1, k2, k3])
+                    dec_hdr = bytes(data[i] ^ key[i % 4] for i in range(32))
+                    h_size, t_size, f_cnt, fn_len = struct.unpack(">IIII", dec_hdr[:16])
+                    if 0 < f_cnt < 2000 and 3 <= fn_len <= 48 and (4 + h_size + t_size == len(data) or 8 + h_size + t_size == len(data)):
+                        # Verify at least the first min(f_cnt, 5) filenames in header are pure printable ASCII
+                        dec_full_hdr = bytes(data[i] ^ key[i % 4] for i in range(min(len(data), 12 + h_size)))
+                        pos = 12
+                        ok = True
+                        for _ in range(min(f_cnt, 5)):
+                            if pos + 4 > len(dec_full_hdr):
+                                ok = False; break
+                            nl = struct.unpack(">I", dec_full_hdr[pos:pos+4])[0]
+                            pos += 4
+                            if nl <= 0 or nl > 80 or pos + nl > len(dec_full_hdr):
+                                ok = False; break
+                            fb = dec_full_hdr[pos:pos+nl]
+                            if not all(32 <= b < 127 for b in fb):
+                                ok = False; break
+                            pos += nl
+                        if ok:
+                            return key
+    """
+    从任意一组加密的 Kairosoft .bytes 归档数据中自动推导 4 字节循环 XOR 密钥。
+    原理：
+      每个 .bytes 归档的前 16 字节为大端序 uint32：
+        word 0 (0..3): header_size (高位字节为 0x00)
+        word 1 (4..7): total_size  (满足 8 + header_size + total_size == len(blob))
+        word 2 (8..11): file_count (高位 3 字节恒为 0x00, 0x00, 0x00)
+        word 3 (12..15): first_filename_len (通常在 3..40 之间)
+    """
+    for name, data in encrypted_blobs.items():
+        if len(data) < 32:
+            continue
+        # 若已经是明文 (前两字节为 0x00 0x00 且第 8..10 字节为 0x00)
+        if data[0] == 0 and data[1] == 0 and data[8] == 0 and data[9] == 0 and data[10] == 0:
+            continue
+        k0, k1, k2 = data[8], data[9], data[10]
+        for k3 in range(256):
+            key = bytes([k0, k1, k2, k3])
+            dec_hdr = bytes(data[i] ^ key[i % 4] for i in range(min(64, len(data))))
+            h_size, t_size, f_cnt, fn_len = struct.unpack(">IIII", dec_hdr[:16])
+            if 0 < f_cnt < 2000 and 4 <= fn_len <= 48 and (8 + h_size + t_size == len(data) or 12 + h_size + t_size == len(data)):
+                fname_bytes = dec_hdr[16 : 16 + min(fn_len, len(dec_hdr) - 16)]
+                if all(32 <= b < 127 for b in fname_bytes):
+                    return key
+    return None
 
-# Load 100% aligned JP -> SC dictionary
-with open('/tmp/gds_extracted/xls/English.lproj/text.txt', 'r', encoding='utf-8') as f:
-    full_lines = f.read().splitlines()
 
-sc = {}
-with open('/tmp/gds_extracted/language/GameDevStory_SC.csv', 'r', encoding='utf-8') as f:
-    for line in f:
-        line = line.rstrip('\r\n')
-        if line.startswith('#') and ',' in line:
-            k, v = line.split(',', 1)
-            # Strip outer quotes if CSV quoted
-            if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
-                v = v[1:-1].replace('""', '"')
-            sc[int(k[1:])] = v
+def parse_explicit_encrypt_key(key_text):
+    """解析 encrypt_key.txt 中的 0x8c4004cd,0x85473370,... 格式密钥"""
+    hex_tokens = re.findall(r"0x[0-9a-fA-F]+", key_text)
+    if not hex_tokens:
+        return None
+    return b"".join(struct.pack("<I", int(h, 16)) for h in hex_tokens)
 
-seen_full = set()
-jp_to_sc = {}
-idx = 0
-for l in full_lines:
-    if l not in seen_full:
-        seen_full.add(l)
-        jp = l.split('\t', 1)[0]
-        if jp not in jp_to_sc:
-            jp_to_sc[jp] = sc.get(idx, jp)
-        jp_norm = jp.replace('\\n', '\n')
-        if jp_norm not in jp_to_sc:
-            jp_to_sc[jp_norm] = sc.get(idx, jp)
-        idx += 1
 
-bsjb = data.find(b'BSJB')
-vlen = struct.unpack_from('<I', data, bsjb + 12)[0]
-pos = bsjb + 16 + vlen + 2
-num_streams = struct.unpack_from('<H', data, pos)[0]
-pos += 2
-streams = {}
-for _ in range(num_streams):
-    soff, ssz = struct.unpack_from('<II', data, pos); pos += 8
-    name = b''
-    while data[pos] != 0: name += bytes([data[pos]]); pos += 1
-    pos = (pos + 4) & ~3
-    streams[name.decode()] = (bsjb + soff, ssz)
+def decrypt_xor(data, key):
+    if not key:
+        return data
+    klen = len(key)
+    return bytes(b ^ key[i % klen] for i, b in enumerate(data))
 
-str_off, _ = streams['#Strings']
-blob_off, _ = streams['#Blob']
-us_off, us_sz = streams['#US']
-tilde_off, _ = streams['#~']
 
-def get_str(i):
-    end = data.find(b'\x00', str_off + i)
-    return data[str_off + i:end].decode('utf-8', errors='replace')
+def unpack_kairo_archive(dec_bytes, out_dir):
+    """解包单个解密后的 Kairosoft .bytes 归档包 (精确对齐 data_start = 8 + header_size)"""
+    if len(dec_bytes) < 16:
+        return []
+    header_size, total_size, file_count = struct.unpack(">III", dec_bytes[0:12])
+    if file_count <= 0 or file_count > 5000 or header_size > len(dec_bytes):
+        return []
+    pos = 12
+    entries = []
+    for _ in range(file_count):
+        if pos + 4 > len(dec_bytes):
+            return []
+        nlen = struct.unpack(">I", dec_bytes[pos : pos + 4])[0]
+        pos += 4
+        if nlen <= 0 or nlen > 256 or pos + nlen > len(dec_bytes):
+            return []
+        fname = dec_bytes[pos : pos + nlen].decode("utf-8", errors="ignore")
+        pos += nlen
+        entries.append(fname)
+    if pos + 8 * file_count > len(dec_bytes):
+        return []
+    offsets = [struct.unpack(">I", dec_bytes[pos + i * 4 : pos + (i + 1) * 4])[0] for i in range(file_count)]
+    pos += 4 * file_count
+    sizes = [struct.unpack(">I", dec_bytes[pos + i * 4 : pos + (i + 1) * 4])[0] for i in range(file_count)]
+    data_start = 8 + header_size
+    os.makedirs(out_dir, exist_ok=True)
+    for fname, off, sz in zip(entries, offsets, sizes):
+        clean_name = fname.replace("\\", "/").lstrip("./")
+        if not clean_name:
+            continue
+        full_p = os.path.join(out_dir, clean_name)
+        os.makedirs(os.path.dirname(full_p), exist_ok=True)
+        with open(full_p, "wb") as f:
+            f.write(dec_bytes[data_start + off : data_start + off + sz])
+    return entries
 
-def read_blob(i):
-    p = blob_off + i
-    b0 = data[p]
-    if (b0 & 0x80) == 0: l = b0; p += 1
-    elif (b0 & 0xC0) == 0x80: l = ((b0 & 0x3F) << 8) | data[p+1]; p += 2
-    else: l = ((b0 & 0x1F) << 24) | (data[p+1] << 16) | (data[p+2] << 8) | data[p+3]; p += 4
-    return data[p:p+l]
 
-def read_us(tok):
-    p = us_off + (tok & 0x00FFFFFF)
-    b0 = data[p]
-    if (b0 & 0x80) == 0: l = b0; p += 1
-    elif (b0 & 0xC0) == 0x80: l = ((b0 & 0x3F) << 8) | data[p+1]; p += 2
-    else: l = ((b0 & 0x1F) << 24) | (data[p+1] << 16) | (data[p+2] << 8) | data[p+3]; p += 4
-    return data[p:p+l-1].decode('utf-16le', errors='replace') if l > 1 else ""
+def extract_named_blobs_from_unity_bytes(raw_bytes):
+    """从 Unity serialized asset 二进制流中扫描全部长度前缀命名的 TextAsset 数据块"""
+    results = {}
+    # 扫描形如 [uint32 name_len][ASCII name][4-byte align padding][uint32 data_len][data]
+    # 使用正则快速定位所有可读资产名称
+    for m in re.finditer(rb"[\x02-\x28]\x00\x00\x00([A-Za-z0-9_\-\.]{2,40})", raw_bytes):
+        off = m.start()
+        if off % 4 != 0:
+            continue
+        nlen = struct.unpack("<I", raw[off : off + 4] if "raw" in globals() else raw_bytes[off : off + 4])[0]
+        if off + 4 + nlen > len(raw_bytes):
+            continue
+        name_bytes = raw_bytes[off + 4 : off + 4 + nlen]
+        if not all(32 <= b < 127 for b in name_bytes):
+            continue
+        name = name_bytes.decode("ascii", errors="ignore")
+        # Check padding bytes are 0
+        aligned_end = off + 4 + ((nlen + 3) & ~3)
+        if any(b != 0 for b in raw_bytes[off + 4 + nlen : aligned_end]):
+            continue
+        if aligned_end + 4 > len(raw_bytes):
+            continue
+        dlen = struct.unpack("<I", raw_bytes[aligned_end : aligned_end + 4])[0]
+        if 0 < dlen <= len(raw_bytes) - (aligned_end + 4):
+            payload = raw_bytes[aligned_end + 4 : aligned_end + 4 + dlen]
+            # Keep largest payload for a given name (avoids tiny shader/material stubs)
+            if name not in results or len(payload) > len(results[name]):
+                results[name] = payload
+    return results
 
-def parse_method_sig(sig_bytes):
-    if not sig_bytes: return (False, 0, False, 1)
-    p = 0
-    cc = sig_bytes[p]; p += 1
-    has_this = bool(cc & 0x20)
-    if cc & 0x10:
-        if (sig_bytes[p] & 0x80) == 0: p += 1
-        elif (sig_bytes[p] & 0xC0) == 0x80: p += 2
-        else: p += 4
-    b0 = sig_bytes[p]
-    if (b0 & 0x80) == 0: param_count = b0; p += 1
-    elif (b0 & 0xC0) == 0x80: param_count = ((b0 & 0x3F) << 8) | sig_bytes[p+1]; p += 2
-    else: param_count = ((b0 & 0x1F) << 24) | (sig_bytes[p+1] << 16) | (sig_bytes[p+2] << 8) | sig_bytes[p+3]; p += 4
-    while p < len(sig_bytes) and sig_bytes[p] in (0x1F, 0x20, 0x45, 0x10):
-        if sig_bytes[p] in (0x1F, 0x20):
-            p += 1
-            if (sig_bytes[p] & 0x80) == 0: p += 1
-            elif (sig_bytes[p] & 0xC0) == 0x80: p += 2
-            else: p += 4
+
+def parse_sc_csv(csv_path):
+    """解析开罗游戏 language/*_sc.csv 或 *_SC.csv，支持多列与跨行续行及公式引用"""
+    sc_cols = {}
+    if not os.path.exists(csv_path):
+        return sc_cols
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read().lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+    cur_idx = None
+    for line in text.split("\n"):
+        line_s = line.strip()
+        if not line_s or line_s.startswith("@") or line_s.startswith('"@'):
+            continue
+        m = re.match(r'^"?#(\d+)"?,(.*)$', line_s)
+        if m:
+            cur_idx = int(m.group(1))
+            rest = m.group(2).strip()
+            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+                rest = rest[1:-1].replace('""', '"')
+            sc_cols[cur_idx] = [rest]
+        elif line_s.startswith(",") and cur_idx is not None:
+            rest = line_s[1:].strip()
+            if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+                rest = rest[1:-1].replace('""', '"')
+            sc_cols[cur_idx].append(rest)
+
+    # Resolve formula references like =#00062 or =MID(#00036,1,-2)&'-2'
+    def resolve_val(v):
+        if not isinstance(v, str) or not v.startswith("="):
+            return v
+        m1 = re.match(r"^=#(\d+)$", v)
+        if m1:
+            ref_id = int(m1.group(1))
+            return sc_cols.get(ref_id, [v])[0]
+        m2 = re.match(r"^=MID\(#(\d+),1,-(\d+)\)&'([^']*)'$", v)
+        if m2:
+            ref_id = int(m2.group(1))
+            cut = int(m2.group(2))
+            base = sc_cols.get(ref_id, [""])[0]
+            return (base[:-cut] if len(base) > cut else base) + m2.group(3)
+        return v
+
+    for k, arr in list(sc_cols.items()):
+        sc_cols[k] = [resolve_val(x) for x in arr]
+    return sc_cols
+
+
+def compile_xls_tables(xls_dir, tpl_ja_text, sc_cols):
+    """
+    将 xls/Japanese.lproj/*.txt 与 language_pack_template_ja + sc_cols 结合，
+    编译为 100% 简体中文的表格字典。
+    """
+    # Map (table_lower, row_idx, col_idx) -> translated string(s)
+    cell_trans = {}
+    if tpl_ja_text and sc_cols:
+        for line in tpl_ja_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            parts = line.split(",", 3)
+            if len(parts) >= 3 and parts[0].strip().isdigit():
+                tid = int(parts[0].strip())
+                if tid not in sc_cols:
+                    continue
+                t_vals = sc_cols[tid]
+                tbl_name = parts[1].strip().lower()
+                for rc in parts[2].split("&"):
+                    if "-" in rc:
+                        r_s, c_s = rc.split("-", 1)
+                        if r_s.isdigit() and c_s.isdigit():
+                            cell_trans[(tbl_name, int(r_s), int(c_s))] = t_vals
+
+    en_dir = os.path.join(xls_dir, "English.lproj")
+    jp_dir = os.path.join(xls_dir, "Japanese.lproj")
+    txt_files_map = {}
+    for d in [en_dir, jp_dir]:
+        if os.path.exists(d):
+            for p in sorted(glob.glob(os.path.join(d, "*.txt"))):
+                txt_files_map[os.path.basename(p).lower()] = p
+    if not txt_files_map:
+        return {}
+
+    tables = {}
+    for _, txt_path in sorted(txt_files_map.items()):
+        tname = os.path.splitext(os.path.basename(txt_path))[0].lower()
+        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw_text = f.read().replace("\r\n", "\n").replace("\r", "\n")
+        # Strip any binary prefix before @id or first printable line
+        id_pos = raw_text.find("@id")
+        if id_pos > 0:
+            raw_text = raw_text[id_pos:]
+        elif raw_text.startswith("\ufeff"):
+            raw_text = raw_text.lstrip("\ufeff")
         else:
-            p += 1
-    ret_type = sig_bytes[p] if p < len(sig_bytes) else 0x01
-    has_ret = (ret_type != 0x01)
-    return (has_this, param_count, has_ret, ret_type)
-
-p = tilde_off
-heap_sizes = data[p+6]
-valid = struct.unpack_from('<Q', data, p+8)[0]
-p += 24
-rows = {}
-for i in range(64):
-    if (valid >> i) & 1: rows[i] = struct.unpack_from('<I', data, p)[0]; p += 4
-str_idx_sz = 4 if (heap_sizes & 1) else 2
-guid_idx_sz = 4 if (heap_sizes & 2) else 2
-blob_idx_sz = 4 if (heap_sizes & 4) else 2
-def coded_sz(tables, bits):
-    m = max(rows.get(t, 0) for t in tables)
-    return 4 if m >= (1 << (16 - bits)) else 2
-typedef_or_ref_sz = coded_sz([2, 1, 27], 2)
-field_idx_sz = 4 if rows.get(4, 0) >= 65536 else 2
-method_idx_sz = 4 if rows.get(6, 0) >= 65536 else 2
-param_idx_sz = 4 if rows.get(8, 0) >= 65536 else 2
-
-t_off = p
-def step(t, row_size):
-    global t_off
-    c = rows.get(t, 0)
-    old = t_off
-    t_off += c * row_size
-    return old
-
-step(0, 2 + str_idx_sz + guid_idx_sz * 3)
-typeref_off = step(1, coded_sz([0, 26, 35, 1], 2) + str_idx_sz * 2)
-typedef_off = step(2, 4 + str_idx_sz * 2 + typedef_or_ref_sz + field_idx_sz + method_idx_sz)
-step(3, field_idx_sz)
-field_off = step(4, 2 + str_idx_sz + blob_idx_sz)
-step(5, method_idx_sz)
-method_off = step(6, 8 + str_idx_sz + blob_idx_sz + param_idx_sz)
-step(7, param_idx_sz)
-step(8, 4 + str_idx_sz)
-step(9, (4 if rows.get(2,0)>=65536 else 2) + typedef_or_ref_sz)
-memberref_off = step(10, coded_sz([2, 1, 26, 6, 27], 3) + str_idx_sz + blob_idx_sz)
-step(11, 2 + coded_sz([4, 8, 23], 2) + blob_idx_sz)
-step(12, coded_sz([6,4,1,2,8,9,10,0,14,23,20,17,26,27,32,35,38,42,43], 5) + coded_sz([6, 10], 3) + blob_idx_sz)
-step(13, coded_sz([4, 8], 1) + blob_idx_sz)
-step(14, 2 + coded_sz([2, 6, 32], 2) + blob_idx_sz)
-step(15, 6 + (4 if rows.get(2,0)>=65536 else 2))
-step(16, 4 + field_idx_sz)
-standalone_off = step(17, blob_idx_sz)
-step(18, (4 if rows.get(2,0)>=65536 else 2) + (4 if rows.get(20,0)>=65536 else 2))
-step(19, 2)
-step(20, 2 + str_idx_sz + typedef_or_ref_sz)
-step(21, (4 if rows.get(2,0)>=65536 else 2) + (4 if rows.get(23,0)>=65536 else 2))
-step(22, 2)
-step(23, 2 + str_idx_sz + blob_idx_sz)
-step(24, 2 + method_idx_sz + coded_sz([20, 23], 1))
-step(25, (4 if rows.get(2,0)>=65536 else 2) + coded_sz([6, 10], 1) * 2)
-step(26, str_idx_sz)
-typespec_off = step(27, blob_idx_sz)
-step(28, 2 + coded_sz([4, 6], 1) + str_idx_sz + (4 if rows.get(26,0)>=65536 else 2))
-frva_off = step(29, 4 + field_idx_sz)
-
-step(30, 8)
-step(31, 4)
-step(32, 16 + blob_idx_sz + str_idx_sz * 2)
-step(33, 4)
-step(34, 12)
-step(35, 16 + blob_idx_sz * 2 + str_idx_sz * 2)
-step(36, 8)
-step(37, 14)
-step(38, 8 + str_idx_sz * 2 + coded_sz([0, 1, 2, 35, 38], 3))
-step(39, 8 + str_idx_sz * 2 + coded_sz([2, 1, 38], 2) + field_idx_sz + method_idx_sz)
-step(40, 8 + str_idx_sz + coded_sz([0, 26, 35, 38, 39], 3))
-step(41, (4 if rows.get(2,0)>=65536 else 2) * 2)
-step(42, 4 + coded_sz([2, 6], 1) + str_idx_sz)
-mspec_mdor_sz = coded_sz([6, 10], 1)
-methodspec_off = step(43, mspec_mdor_sz + blob_idx_sz)
-
-
-print("Tables parsed successfully, frva_off=", frva_off)
-
-# Build full lookup tables for Types, Fields, Methods, MemberRefs, FieldRVAs
-td_sz = 4 + str_idx_sz * 2 + typedef_or_ref_sz + field_idx_sz + method_idx_sz
-md_sz = 8 + str_idx_sz + blob_idx_sz + param_idx_sz
-fd_sz = 2 + str_idx_sz + blob_idx_sz
-tr_sz = coded_sz([0, 26, 35, 1], 2) + str_idx_sz * 2
-mr_parent_sz = coded_sz([2, 1, 26, 6, 27], 3)
-mr_sz = mr_parent_sz + str_idx_sz + blob_idx_sz
-
-type_names = {}
-method_to_type = {}
-field_to_type = {}
-for i in range(1, rows[2] + 1):
-    off = typedef_off + (i - 1) * td_sz
-    tname = get_str(struct.unpack_from('<I', data, off + 4)[0])
-    tns = get_str(struct.unpack_from('<I', data, off + 8)[0])
-    full = f"{tns}.{tname}" if tns else tname
-    type_names[i] = full
-    f_start = struct.unpack_from('<H', data, off + 4 + str_idx_sz * 2 + typedef_or_ref_sz)[0]
-    m_start = struct.unpack_from('<H', data, off + 4 + str_idx_sz * 2 + typedef_or_ref_sz + field_idx_sz)[0]
-    f_end = struct.unpack_from('<H', data, off + td_sz + 4 + str_idx_sz * 2 + typedef_or_ref_sz)[0] if i < rows[2] else rows[4] + 1
-    m_end = struct.unpack_from('<H', data, off + td_sz + 4 + str_idx_sz * 2 + typedef_or_ref_sz + field_idx_sz)[0] if i < rows[2] else rows[6] + 1
-    for f in range(f_start, f_end): field_to_type[f] = full
-    for m in range(m_start, m_end): method_to_type[m] = full
-
-typeref_names = {}
-res_sz = coded_sz([0, 26, 35, 1], 2)
-for i in range(1, rows[1] + 1):
-    off = typeref_off + (i - 1) * tr_sz
-    tname = get_str(struct.unpack_from('<I', data, off + res_sz)[0])
-    tns = get_str(struct.unpack_from('<I', data, off + res_sz + str_idx_sz)[0])
-    typeref_names[i] = f"{tns}.{tname}" if tns else tname
-
-field_info = {}
-for i in range(1, rows[4] + 1):
-    off = field_off + (i - 1) * fd_sz
-    flags = struct.unpack_from('<H', data, off)[0]
-    fname = get_str(struct.unpack_from('<I', data, off + 2)[0])
-    field_info[0x04000000 | i] = {
-        'name': f"{field_to_type.get(i, '?')}::{fname}",
-        'shortName': fname,
-        'static': bool(flags & 0x0010)
-    }
-
-field_rvas = {}
-rva_list = []
-for i in range(rows[29]):
-    rva, f_idx = struct.unpack_from('<IH', data, frva_off + i * 6)
-    tok = 0x04000000 | f_idx
-    field_rvas[tok] = rva
-    rva_list.append((tok, rva))
-
-rva_bytes = {}
-for idx_r, (tok, rva) in enumerate(rva_list):
-    # Find next distinct RVA to determine buffer size
-    next_distinct = None
-    for j in range(idx_r + 1, len(rva_list)):
-        if rva_list[j][1] > rva:
-            next_distinct = rva_list[j][1]
-            break
-    bsz = (next_distinct - rva) if next_distinct is not None else 64
-    if bsz <= 0 or bsz > 1024:
-        bsz = 40
-    foff = rva - 0x1e00
-    rva_bytes[tok] = list(data[foff:foff+bsz])
-
-def get_locals_count(local_sig_tok):
-    if local_sig_tok == 0: return 0
-    idx = local_sig_tok & 0xFFFFFF
-    b_idx = struct.unpack_from('<I' if blob_idx_sz == 4 else '<H', data, standalone_off + (idx - 1) * blob_idx_sz)[0]
-    sb = read_blob(b_idx)
-    if not sb or sb[0] != 0x07: return 0
-    p = 1
-    b0 = sb[p]
-    if (b0 & 0x80) == 0: return b0
-    elif (b0 & 0xC0) == 0x80: return ((b0 & 0x3F) << 8) | sb[p+1]
-    else: return ((b0 & 0x1F) << 24) | (sb[p+1] << 16) | (sb[p+2] << 8) | sb[p+3]
-
-method_sigs = {}
-for i in range(1, rows[6] + 1):
-    off = method_off + (i - 1) * md_sz
-    rva = struct.unpack_from('<I', data, off)[0]
-    flags = struct.unpack_from('<H', data, off + 6)[0]
-    mname = get_str(struct.unpack_from('<I', data, off + 8)[0])
-    b_idx = struct.unpack_from('<I' if blob_idx_sz == 4 else '<H', data, off + 8 + str_idx_sz)[0]
-    has_this, pcount, has_ret, ret_type = parse_method_sig(read_blob(b_idx))
-    method_sigs[0x06000000 | i] = {
-        'type': method_to_type.get(i, '?'),
-        'name': mname,
-        'full': f"{method_to_type.get(i, '?')}::{mname}",
-        'rva': rva,
-        'hasThis': has_this,
-        'params': pcount,
-        'hasRet': has_ret
-    }
-
-for i in range(1, rows[10] + 1):
-    off = memberref_off + (i - 1) * mr_sz
-    parent = struct.unpack_from('<H' if mr_parent_sz == 2 else '<I', data, off)[0]
-    mname = get_str(struct.unpack_from('<I', data, off + mr_parent_sz)[0])
-    b_idx = struct.unpack_from('<I' if blob_idx_sz == 4 else '<H', data, off + mr_parent_sz + str_idx_sz)[0]
-    sig_b = read_blob(b_idx)
-    tag = parent & 7
-    idx = parent >> 3
-    pname = type_names.get(idx, '?') if tag == 0 else (typeref_names.get(idx, '?') if tag == 1 else f"tag{tag}_{idx}")
-    if sig_b and sig_b[0] == 0x06: # Field ref!
-        field_info[0x0A000000 | i] = {
-            'name': f"{pname}::{mname}",
-            'shortName': mname,
-            'static': False
-        }
-    else:
-        has_this, pcount, has_ret, ret_type = parse_method_sig(sig_b)
-        method_sigs[0x0A000000 | i] = {
-            'type': pname,
-            'name': mname,
-            'full': f"{pname}::{mname}",
-            'rva': 0,
-            'hasThis': has_this,
-            'params': pcount,
-            'hasRet': has_ret
-        }
-
-
-for i in range(1, rows.get(43, 0) + 1):
-    off = methodspec_off + (i - 1) * (mspec_mdor_sz + blob_idx_sz)
-    mdor = struct.unpack_from('<H' if mspec_mdor_sz == 2 else '<I', data, off)[0]
-    base_tok = (0x06000000 if (mdor & 1) == 0 else 0x0A000000) | (mdor >> 1)
-    if base_tok in method_sigs:
-        method_sigs[0x2B000000 | i] = dict(method_sigs[base_tok])
-
-print("Total method_sigs:", len(method_sigs), "field_info:", len(field_info))
-
-# Decode all methods in target classes into pre-parsed instruction arrays
-target_types = {
-    'kairo.unity.form.FormBase',
-    'kairo.unity.form.FormManagerBase',
-    'form.BootForm',
-    'form.FormManager',
-    'form.GameForm',
-    'form.MyFormBase',
-    'form.RankForm',
-    'form.SpForm',
-    'form.SubForm',
-    'form.TitleForm',
-    'main.Anim',
-    'main.AppData',
-    'surface.GameView',
-    'surface.GamePad',
-    'kairo.unity.surface.SurfaceBase',
-    'kairo.unity.surface.TouchComponent',
-    'kairo.unity.surface.TouchEvent',
-    'kairo.unity.surface.TouchOption',
-    'kairo.unity.ui.Balloon',
-    'kairo.unity.ui.Seb',
-    'kairo.unity.ui.ResourceManager',
-    '<SetPanel>c__AnonStorey7B',
-    'cfg.MyConfig'
-}
-
-string_pool = []
-string_map = {}
-def intern_str(s):
-    if s not in string_map:
-        string_map[s] = len(string_pool)
-        string_pool.append(s)
-    return string_map[s]
-
-compiled_methods = {}
-
-for tok, msig in list(method_sigs.items()):
-    if (tok >> 24) != 0x06: continue
-    if msig['type'] not in target_types: continue
-    rva = msig['rva']
-    if rva == 0: continue
-    boff = rva - 0x1e00
-    b = data[boff]
-    raw_eh = []
-    if (b & 3) == 2:
-        code = data[boff+1 : boff+1+(b>>2)]
-        locals_cnt = 0
-    else:
-        mflags = struct.unpack_from('<H', data, boff)[0] & 0x0FFF
-        csz = struct.unpack_from('<I', data, boff + 4)[0]
-        local_tok = struct.unpack_from('<I', data, boff + 8)[0]
-        code = data[boff+12 : boff+12+csz]
-        locals_cnt = get_locals_count(local_tok)
-        if mflags & 0x0008:
-            eh_off = (boff + 12 + csz + 3) & ~3
-            skind = data[eh_off]
-            if (skind & 0x3F) == 1:
-                if skind & 0x40:
-                    dsz = struct.unpack_from('<I', data, eh_off)[0] >> 8
-                    ncl = (dsz - 4) // 24
-                    for ci in range(ncl):
-                        cf, toff, tlen, hoff, hlen, ctok = struct.unpack_from('<IIIIII', data, eh_off + 4 + ci * 24)
-                        raw_eh.append((cf, toff, toff + tlen, hoff))
-                else:
-                    dsz = data[eh_off + 1]
-                    ncl = (dsz - 4) // 12
-                    for ci in range(ncl):
-                        cf, toff, tlen, hoff, hlen, ctok = struct.unpack_from('<HHBHBI', data, eh_off + 4 + ci * 12)
-                        raw_eh.append((cf, toff, toff + tlen, hoff))
-
-    # First pass: map byte offset ip -> instruction index
-    ip_to_idx = {}
-    raw_insns = []
-    ip = 0
-    while ip < len(code):
-        ip0 = ip
-        ip_to_idx[ip0] = len(raw_insns)
-        op = code[ip]; ip += 1
-        if op == 0xFE:
-            op2 = code[ip]; ip += 1
-            full_op = 0xFE00 | op2
-            if op2 == 0x06:
-                arg = struct.unpack_from('<I', code, ip)[0]; ip += 4
-            elif op2 in (0x09,0x0A,0x0B,0x0C,0x0D,0x0E):
-                arg = struct.unpack_from('<H', code, ip)[0]; ip += 2
-            elif op2 in (0x15,0x16,0x1A):
-                arg = struct.unpack_from('<I', code, ip)[0]; ip += 4
-            else:
-                arg = 0
-            raw_insns.append([full_op, arg, ip])
+            # Strip binary header before first digit or @
+            m_start = re.search(r"[0-9@]", raw_text)
+            if m_start and m_start.start() < 32:
+                raw_text = raw_text[m_start.start():]
+        if tname == "talk" and raw_text.count("\n") <= 2 and "|" in raw_text:
+            lines = raw_text.split("|")
+        else:
+            lines = raw_text.split("\n")
+        if lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
             continue
 
-        if op in (0x20, 0x72, 0x28, 0x6F, 0x70, 0x71, 0x73, 0x74, 0x75, 0x79, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x8C, 0x8D, 0x8F, 0xA3, 0xA4, 0xA5, 0xD0):
-            if op == 0x20:
-                arg = struct.unpack_from('<i', code, ip)[0]
-            elif op == 0x72:
-                utok = struct.unpack_from('<I', code, ip)[0]
-                arg = intern_str(read_us(utok))
+        rows = [l.split("\t") for l in lines]
+        for r_idx, row in enumerate(rows):
+            for c_idx in range(len(row)):
+                if (tname, r_idx, c_idx) in cell_trans:
+                    t_vals = cell_trans[(tname, r_idx, c_idx)]
+                    for offset, tv in enumerate(t_vals):
+                        if c_idx + offset < len(row):
+                            row[c_idx + offset] = tv
+                        else:
+                            row.append(tv)
+        tables[tname] = rows
+    return tables
+
+
+def clean_kairo_markup(s):
+    if not isinstance(s, str):
+        return ""
+    s = re.sub(r"<co=[^>]+>", "", s)
+    s = re.sub(r"</co>", "", s)
+    s = re.sub(r"<po=[^>]+>", "", s)
+    s = re.sub(r"<pic=[^>]+>", "", s)
+    s = s.replace("<ff>", "").replace("<br>", " ").replace("\\n", " ")
+    return s.strip()
+
+
+def load_inf_map(inf_path):
+    res = {}
+    if not os.path.exists(inf_path):
+        return res
+    with open(inf_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if "\t" in line:
+                k, v = line.split("\t", 1)
+                if k.lstrip("-").isdigit():
+                    fn = v.split(",")[0].strip().replace(".gif", ".png")
+                    res[int(k)] = fn
+    return res
+
+
+def resolve_seb_table(folder, id_offset=0):
+    img_map = load_inf_map(os.path.join(folder, "img.inf"))
+    seb_map = load_inf_map(os.path.join(folder, "seb.inf"))
+    out = {}
+    for seb_id, seb_fn in seb_map.items():
+        seb_path = os.path.join(folder, seb_fn)
+        base = os.path.splitext(seb_fn)[0]
+        best = None
+        if os.path.exists(seb_path):
+            with open(seb_path, "rb") as f:
+                raw = f.read()
+            if len(raw) >= 24:
+                shorts = struct.unpack(">12h", raw[:24])
+                img_idx, sx, sy, sw, sh, ox, oy = shorts[5], shorts[6], shorts[7], shorts[8], shorts[9], shorts[10], shorts[11]
+                if img_idx in img_map and sw >= 12 and sh >= 12:
+                    best = {"seb": seb_fn, "img": img_map[img_idx], "sx": max(0, sx), "sy": max(0, sy), "sw": sw, "sh": sh, "ox": ox, "oy": oy}
+        if not best:
+            for cand in [base + ".png", base + "00.png", base.replace("_a", "") + ".png", base.replace("_", "") + ".png"]:
+                p = os.path.join(folder, cand)
+                if os.path.exists(p):
+                    with open(p, "rb") as f:
+                        b = f.read(24)
+                    if len(b) >= 24 and b[:8] == b"\x89PNG\r\n\x1a\n":
+                        w, h = struct.unpack(">II", b[16:24])
+                        best = {"seb": seb_fn, "img": cand, "sx": 0, "sy": 0, "sw": min(w, 120), "sh": min(h, 120), "ox": 0, "oy": -24}
+                        break
+        if best:
+            out[str(seb_id + id_offset)] = best
+    return out
+
+
+if __name__ == "__main__":
+    print("apk2cartridge module loaded.")
+
+
+def build_universal_cartridge(input_path, game_id, out_bin_path=None, custom_title=None):
+    """
+    通用提取主入口：支持 Android APK (.apk)、PC/Steam 压缩包 (.zip) 或已解压目录。
+    自动解包资源、破解 XOR 密钥、编译简体中文策划表并输出标准化 game.bin 与 manifest.json。
+    """
+    work_dir = tempfile.mkdtemp(prefix=f"kairo_extract_{game_id}_")
+    unpacked_dir = os.path.join(work_dir, "unpacked")
+    os.makedirs(unpacked_dir, exist_ok=True)
+
+    named_blobs = {}
+    standalone_pngs = {}
+
+    if os.path.isdir(input_path):
+        # Scan directory for resources.assets or assets/bin/Data/*
+        for root, dirs, files in os.walk(input_path):
+            for fn in files:
+                if fn == "resources.assets" or re.match(r"^[0-9a-f]{32}$", fn):
+                    with open(os.path.join(root, fn), "rb") as f:
+                        blobs = extract_named_blobs_from_unity_bytes(f.read())
+                        for k, v in blobs.items():
+                            if k not in named_blobs or len(v) > len(named_blobs[k]):
+                                named_blobs[k] = v
+    else:
+        with zipfile.ZipFile(input_path, "r") as zf:
+            for info in zf.infolist():
+                n = info.filename
+                if "__MACOSX" in n or n.endswith(".resource") or n.endswith(".resS"):
+                    continue
+                base = os.path.basename(n)
+                if base == "resources.assets" or (n.startswith("assets/bin/Data/") and re.match(r"^[0-9a-f]{32}$", base)):
+                    raw = zf.read(n)
+                    blobs = extract_named_blobs_from_unity_bytes(raw)
+                    for k, v in blobs.items():
+                        if k not in named_blobs or len(v) > len(named_blobs[k]):
+                            named_blobs[k] = v
+
+    # 1. Determine XOR encryption key
+    xor_key = None
+    if "encrypt_key" in named_blobs:
+        xor_key = parse_explicit_encrypt_key(named_blobs["encrypt_key"].decode("utf-8", errors="ignore"))
+    if not xor_key:
+        xor_key = auto_recover_xor_key(named_blobs)
+
+    print(f"[{game_id}] Discovered {len(named_blobs)} Unity named assets. Auto-recovered XOR key: {xor_key.hex() if xor_key else 'None'}")
+
+    # 2. Unpack all Kairosoft .bytes archives and standalone PNGs
+    archive_counts = {}
+    for name, payload in sorted(named_blobs.items()):
+        if name.endswith(".png") and payload[:8] == b"\x89PNG\r\n\x1a\n":
+            standalone_pngs[name] = payload
+            with open(os.path.join(unpacked_dir, name), "wb") as f:
+                f.write(payload)
+            continue
+        if len(payload) < 16 or name in ("encrypt_key", "filelist", "language_pack_template_en", "language_pack_template_ja", "language_pack_format"):
+            continue
+        # Check if plain Kairosoft archive or XOR-encrypted archive
+        is_plain = (payload[0] == 0 and payload[1] == 0 and payload[8] == 0 and payload[9] == 0 and payload[10] == 0)
+        dec = payload if is_plain else decrypt_xor(payload, xor_key)
+        if dec[:2] == b"\x00\x00" and dec[8:10] == b"\x00\x00":
+            files = unpack_kairo_archive(dec, os.path.join(unpacked_dir, name))
+            if files:
+                archive_counts[name] = len(files)
+
+    print(f"[{game_id}] Unpacked {len(archive_counts)} Kairosoft archives: {archive_counts}")
+
+    # 3. Parse Simplified Chinese CSV & language_pack_template_ja
+    lang_dir = os.path.join(unpacked_dir, "language")
+    sc_csv_path = None
+    if os.path.exists(lang_dir):
+        for fn in os.listdir(lang_dir):
+            if fn.lower().endswith("_sc.csv") or fn.lower() == "zh-cn.csv":
+                sc_csv_path = os.path.join(lang_dir, fn)
+                break
+    sc_cols = parse_sc_csv(sc_csv_path) if sc_csv_path else {}
+    tpl_ja_text = ""
+    if "language_pack_template_ja" in named_blobs:
+        tpl_ja_text = named_blobs["language_pack_template_ja"].decode("utf-8", errors="ignore")
+
+    xls_dir = os.path.join(unpacked_dir, "xls")
+    tables = compile_xls_tables(xls_dir, tpl_ja_text, sc_cols) if os.path.exists(xls_dir) else {}
+
+    # 4. Extract game title & structured catalog from compiled tables
+    detected_title = custom_title or game_id
+    if not custom_title:
+        if "text" in tables and len(tables["text"]) > 0 and len(tables["text"][0]) > 1:
+            t0 = clean_kairo_markup(tables["text"][0][1])
+            if t0:
+                detected_title = t0
+        if detected_title == game_id and sc_cols:
+            for k in sorted(sc_cols.keys()):
+                val = clean_kairo_markup(sc_cols[k][0]) if sc_cols[k] else ""
+                if 4 <= len(val) <= 10 and ("物语" in val or "发展国" in val):
+                    detected_title = val
+                    break
+        if detected_title == game_id and "farm" in game_id.lower():
+            detected_title = "像素牧场物语" 
+
+    # Collect PNG textures (prioritizing zh-CN localized overrides, title, com, game, chip, chip2, buildui, build, body, head, vehicle, dish)
+    png_b64 = {}
+    png_dims = {}
+
+    def add_png_file(key_name, file_path):
+        if not os.path.exists(file_path):
+            return
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+            return
+        w, h = struct.unpack(">II", raw[16:24])
+        if w > 1024 or h > 1024:
+            return
+        png_b64[key_name] = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        png_dims[key_name] = [w, h, 1]
+
+    # Add standalone PNGs (airplanes, trees, flowers, sidewalks, etc.)
+    for name in sorted(standalone_pngs.keys()):
+        if not name.startswith("ImageAtlas") and not name.startswith("chip2_") and not name.startswith("schip_"):
+            add_png_file(name, os.path.join(unpacked_dir, name))
+
+    # Add archive PNGs without redundant duplication
+    collide_names = {"bg.png", "back.png", "bar.png", "title.png", "button.png", "cursor.png", "frame.png", "arrow.png", "chip.png", "spot.png"}
+    for folder in ["title", "com", "game", "buildui", "build", "chip", "chip2", "vehicle", "dish", "chart"]:
+        fdir = os.path.join(unpacked_dir, folder)
+        if not os.path.exists(fdir):
+            continue
+        for p in sorted(glob.glob(os.path.join(fdir, "*.png"))):
+            bn = os.path.basename(p)
+            if folder == "title" or bn in collide_names:
+                add_png_file(f"{folder}_{bn}", p)
+            if bn not in png_b64:
+                add_png_file(bn, p)
+        zh_dir = os.path.join(fdir, "zh-CN")
+        if os.path.exists(zh_dir):
+            for p in sorted(glob.glob(os.path.join(zh_dir, "*.png"))):
+                bn = os.path.basename(p)
+                if folder == "title" or bn in collide_names:
+                    add_png_file(f"{folder}_{bn}", p)
+                add_png_file(bn, p)
+
+    # Add sample character heads & bodies for visitors/staff
+    for folder, limit in [("body", 18), ("head", 18), ("body_animal", 12)]:
+        fdir = os.path.join(unpacked_dir, folder)
+        if os.path.exists(fdir):
+            for p in sorted(glob.glob(os.path.join(fdir, "*.png")))[:limit]:
+                bn = os.path.basename(p)
+                add_png_file(f"{folder}_{bn}", p)
+
+    # 5. Build structured facility/build items, quests, goods/planes, and dialogs from compiled tables
+    chip_img_map = load_inf_map(os.path.join(unpacked_dir, "chip", "img.inf"))
+    chip_seb_table = resolve_seb_table(os.path.join(unpacked_dir, "chip"), 0)
+    chip2_dir = os.path.join(unpacked_dir, "chip2")
+    if os.path.exists(chip2_dir):
+        chip_seb_table.update(resolve_seb_table(chip2_dir, 2000))
+
+    build_items = []
+    is_airport = "airplanes" in tables
+    if "chips" in tables:
+        rows = tables["chips"]
+        start_r = 1 if rows and rows[0][0].startswith("@") else 0
+        for r in rows[start_r:]:
+            if len(r) < 10:
+                continue
+            cid = r[0].strip()
+            if not cid.lstrip("-").isdigit():
+                continue
+            name = clean_kairo_markup(r[2] if is_airport else r[1])
+            if not name or name.startswith("!") or "ダミー" in name or "カウント" in name or "施工" in name or "出入口" in name:
+                continue
+            if is_airport:
+                # Jumbo Airport Story chips.txt columns:
+                # 0:@id, 2:@name, 5:buildCategory, 27:seb, 36:sizeW, 37:sizeH, 46:buildPrice, 47:upkeep, 50:charge, 52:quality, 53:popularity, 54:mood, 71:explain
+                bcat = int(r[5]) if len(r) > 5 and r[5].lstrip("-").isdigit() else -1
+                if bcat < 0:
+                    continue
+                seb_id = r[27].strip() if len(r) > 27 else "-1"
+                price = int(r[46]) if len(r) > 46 and r[46].lstrip("-").isdigit() else 1000
+                upkeep = int(r[47]) if len(r) > 47 and r[47].lstrip("-").isdigit() else 0
+                charge = int(r[50]) if len(r) > 50 and r[50].lstrip("-").isdigit() else 100
+                pop = int(r[53]) if len(r) > 53 and r[53].lstrip("-").isdigit() else 5
+                mood = int(r[54]) if len(r) > 54 and r[54].lstrip("-").isdigit() else 5
+                desc = clean_kairo_markup(r[71]) if len(r) > 71 else "提升机场人气与旅客满意度的设施。"
+                sw_tiles = int(r[36]) if len(r) > 36 and r[36].isdigit() else 1
+                sh_tiles = int(r[37]) if len(r) > 37 and r[37].isdigit() else 1
             else:
-                arg = struct.unpack_from('<I', code, ip)[0]
-            ip += 4
-        elif op == 0x22:
-            v = struct.unpack_from('<f', code, ip)[0]; ip += 4
-            arg = 0.0 if (v != v or v == float("inf") or v == float("-inf")) else round(v, 6)
-        elif op == 0x21:
-            arg = struct.unpack_from('<q', code, ip)[0]; ip += 8
-        elif op == 0x23:
-            v = struct.unpack_from('<d', code, ip)[0]; ip += 8
-            arg = 0.0 if (v != v or v == float("inf") or v == float("-inf")) else round(v, 6)
-        elif op in (0x38,0x39,0x3A,0x3B,0x3C,0x3D,0x3E,0x3F,0x40,0x41,0x42,0x43,0x44,0xDD):
-            rel = struct.unpack_from('<i', code, ip)[0]; ip += 4
-            arg = ('br', ip + rel)
-        elif op in (0x2B,0x2C,0x2D,0x2E,0x2F,0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0xDE):
-            rel = struct.unpack_from('<b', code, ip)[0]; ip += 1
-            arg = ('br', ip + rel)
-        elif op == 0x1F:
-            arg = struct.unpack_from('<b', code, ip)[0]; ip += 1
-        elif op in (0x0E,0x0F,0x10,0x11,0x12,0x13):
-            arg = code[ip]; ip += 1
-        elif op == 0x45:
-            n = struct.unpack_from('<I', code, ip)[0]; ip += 4
-            targets = []
-            base_ip = ip + n * 4
-            for _ in range(n):
-                rel = struct.unpack_from('<i', code, ip)[0]; ip += 4
-                targets.append(base_ip + rel)
-            arg = ('sw', targets)
-        else:
-            arg = 0
-        raw_insns.append([op, arg, ip])
+                # 8BitFarm chips.txt columns:
+                # 0:id, 1:name, 2:subname, 4:buildCategory (0=农田/牧栏, 1=景点, 2=店铺, 3=设施), 5:seb/img, 14:w, 15:h, 19:explain, 21:price, 22:upkeep, 23:charge, 24:charm, 25:scenery
+                bcat = int(r[4]) if len(r) > 4 and r[4].lstrip("-").isdigit() else -1
+                if bcat not in (0, 1, 2, 3):
+                    continue
+                if "_" in name and not name.endswith("_上") and not name.endswith("10_上"):
+                    continue
+                name = name.replace("_上", "")
+                seb_id = r[5].strip() if len(r) > 5 else "-1"
+                price = int(r[20]) if len(r) > 20 and r[20].lstrip("-").isdigit() else 1000
+                upkeep = int(r[21]) if len(r) > 21 and r[21].lstrip("-").isdigit() else 0
+                charge = int(r[22]) if len(r) > 22 and r[22].lstrip("-").isdigit() else 100
+                pop = int(r[23]) if len(r) > 23 and r[23].lstrip("-").isdigit() else 8
+                mood = int(r[24]) if len(r) > 24 and r[24].lstrip("-").isdigit() else 10
+                desc = clean_kairo_markup(r[18]) if len(r) > 18 and r[18].strip() else "能够吸引游客造访并提升牧场魅力的设施。"
+                sw_tiles = int(r[14]) if len(r) > 14 and r[14].isdigit() else 1
+                sh_tiles = int(r[15]) if len(r) > 15 and r[15].isdigit() else 1
 
-    # Second pass: resolve branch targets to instruction indices
-    insns = []
-    for op, arg, next_ip in raw_insns:
-        if isinstance(arg, tuple) and arg[0] == 'br':
-            insns.append([op, ip_to_idx.get(arg[1], 0)])
-        elif isinstance(arg, tuple) and arg[0] == 'sw':
-            insns.append([op, [ip_to_idx.get(t, 0) for t in arg[1]]])
-        else:
-            insns.append([op, arg])
+            # Resolve sprite info
+            spr = chip_seb_table.get(seb_id)
+            img_key = ""
+            if spr and f"chip_{spr['img']}" in png_b64:
+                img_key = f"chip_{spr['img']}"
+            elif spr and spr["img"] in png_b64:
+                img_key = spr["img"]
+            elif seb_id.lstrip("-").isdigit() and int(seb_id) in chip_img_map:
+                cand = chip_img_map[int(seb_id)]
+                if f"chip_{cand}" in png_b64:
+                    img_key = f"chip_{cand}"
+                elif cand in png_b64:
+                    img_key = cand
 
-    eh_clauses = []
-    for cf, ts, te, hs in raw_eh:
-        eh_clauses.append([cf, ip_to_idx.get(ts, 0), ip_to_idx.get(te, len(insns)), ip_to_idx.get(hs, 0)])
-    compiled_methods[tok] = {
-        'type': msig['type'],
-        'name': msig['name'],
-        'full': msig['full'],
-        'hasThis': msig['hasThis'],
-        'params': msig['params'],
-        'hasRet': msig['hasRet'],
-        'locals': locals_cnt,
-        'insns': insns,
-        'eh': eh_clauses
+            # Avoid duplicate names
+            if any(b["name"] == name for b in build_items):
+                continue
+
+            build_items.append({
+                "id": int(cid),
+                "name": name,
+                "category": bcat,
+                "price": max(100, price),
+                "upkeep": upkeep,
+                "charge": max(50, charge),
+                "popularity": max(2, pop),
+                "scenery": max(2, mood),
+                "w": max(1, min(3, sw_tiles)),
+                "h": max(1, min(3, sh_tiles)),
+                "desc": desc or f"建造{name}，提升整体评价与营收。",
+                "imgKey": img_key,
+                "sprite": spr
+            })
+
+    # Extract special catalogs (Airplanes/Cities/Airlines for Airport, or Crops/Goods/Contests for Farm)
+    special_items = []
+    routes_or_products = []
+    challenges = []
+
+    if is_airport:
+        # Airplanes
+        for r in tables.get("airplanes", [])[1:]:
+            if len(r) > 20 and r[0].isdigit():
+                aid = int(r[0])
+                aname = clean_kairo_markup(r[2])
+                model = clean_kairo_markup(r[4])
+                cap = int(r[6]) if r[6].isdigit() else 4
+                price = int(r[19]) if r[19].isdigit() else 45000
+                desc = clean_kairo_markup(r[24]) if len(r) > 24 else "高性能客机。"
+                plane_imgs = ["b747_b.png", "bonanza_b.png", "cessna_b.png", "concord_b.png", "conste_b.png", "dc9_b.png", "pa34_b.png", "helicopter.png", "kairoballoon.png", "airship.png"]
+                img_idx = int(r[22]) if len(r) > 22 and r[22].isdigit() else (aid % len(plane_imgs))
+                p_img = plane_imgs[img_idx % len(plane_imgs)]
+                special_items.append({
+                    "id": aid,
+                    "name": f"{aname} ({model})",
+                    "cost": max(5000, price // 10),
+                    "power": cap * 15,
+                    "income": cap * 180,
+                    "imgKey": p_img if p_img in png_b64 else "",
+                    "desc": desc
+                })
+        # Cities & Routes
+        for r in tables.get("city", [])[1:]:
+            if len(r) > 2 and r[0].isdigit():
+                cid = int(r[0])
+                cname = clean_kairo_markup(r[2])
+                cdesc = clean_kairo_markup(r[19]) if len(r) > 19 else "热门通航城市。"
+                routes_or_products.append({
+                    "id": cid,
+                    "name": f"{cname}航线",
+                    "city": cname,
+                    "cost": 1500 + cid * 1200,
+                    "reward": 800 + cid * 450,
+                    "desc": cdesc.replace("<name>", detected_title)
+                })
+        # Quests & Rankup
+        for r in tables.get("quest", [])[1:25]:
+            if len(r) > 2 and r[0].isdigit():
+                qid = int(r[0])
+                qname = clean_kairo_markup(r[2])
+                qdesc = clean_kairo_markup(r[29]) if len(r) > 29 else "完成机场宣传与投资任务。"
+                if qname:
+                    challenges.append({
+                        "id": qid,
+                        "name": qname,
+                        "cost": 1000 + (qid % 8) * 800,
+                        "reward": 3000 + (qid % 10) * 1500,
+                        "desc": qdesc
+                    })
+    else:
+        # 8BitFarm: Hatake (Crops/Flowers/Animals)
+        for r in tables.get("hatake", []):
+            if len(r) > 5 and r[0].isdigit():
+                hid = int(r[0])
+                hname = clean_kairo_markup(r[1])
+                if not hname:
+                    continue
+                special_items.append({
+                    "id": hid,
+                    "name": hname,
+                    "cost": 400 + (hid % 12) * 250,
+                    "power": 15 + (hid % 8) * 10,
+                    "income": 350 + (hid % 10) * 120,
+                    "imgKey": f"hana0{hid % 7}.png" if f"hana0{hid % 7}.png" in png_b64 else "",
+                    "desc": f"在农田与花田中培育【{hname}】，吸引游客拍照并提升牧场品质。"
+                })
+        # Syouhin (Shop Products)
+        for r in tables.get("syouhin", [])[:24]:
+            if len(r) > 2 and r[0].isdigit():
+                sid = int(r[0])
+                sname = clean_kairo_markup(r[1])
+                if sname and not any(x["name"] == sname for x in routes_or_products):
+                    routes_or_products.append({
+                        "id": sid,
+                        "name": sname,
+                        "city": "牧场特产",
+                        "cost": 600 + (sid % 10) * 300,
+                        "reward": 450 + (sid % 8) * 180,
+                        "desc": f"在牧场店铺上架【{sname}】，大幅提升游客消费额与满意度。"
+                    })
+        # Contests & Taikai
+        for r in tables.get("contest", [])[:20]:
+            if len(r) > 3 and r[0].isdigit():
+                cid = int(r[0])
+                cname = clean_kairo_markup(r[1])
+                cdesc = clean_kairo_markup(r[3]) if len(r) > 3 else "参加全国牧场竞赛赢取奖金与声誉！"
+                if cname:
+                    challenges.append({
+                        "id": cid,
+                        "name": cname,
+                        "cost": 800 + (cid % 6) * 500,
+                        "reward": 2500 + (cid % 8) * 1200,
+                        "desc": cdesc
+                    })
+
+    # Extract opening tutorial lines from talk table
+    opening_dialogs = []
+    if "talk" in tables:
+        talk_rows = [r for r in tables["talk"] if r and not r[0].startswith("@")]
+        target_row = talk_rows[0] if is_airport else (talk_rows[1] if len(talk_rows) > 1 else talk_rows[0])
+        for cell in target_row[2:]:
+            txt = clean_kairo_markup(cell).replace("<name>", "开罗国际机场" if is_airport else "开罗像素牧场").replace("<0>", "开罗像素牧场").replace("<charaname>", "小佳")
+            if len(txt) >= 3 and not txt.lstrip("-").isdigit():
+                opening_dialogs.append(txt)
+
+    # Extract manual entries
+    manual_pages = []
+    if "manual" in tables and tables["manual"]:
+        for cell in tables["manual"][0]:
+            txt = clean_kairo_markup(cell)
+            if len(txt) > 15:
+                manual_pages.append(txt)
+
+    # Extract combo dictionary entries
+    combos = []
+    combo_tbl = tables.get("combinations") or tables.get("combination") or []
+    for r in combo_tbl[:25]:
+        line_str = " · ".join(clean_kairo_markup(c) for c in r if clean_kairo_markup(c) and not c.lstrip("-").isdigit())
+        if line_str:
+            combos.append(line_str)
+
+    bundle_payload = {
+        "format": "KAIRO_UNIVERSAL_DATA_V1",
+        "meta": {
+            "id": game_id,
+            "title": detected_title,
+            "subtitle": f"{detected_title} · 简体中文泛用提取版",
+            "version": "1.0.0",
+            "resolution": [240, 284],
+            "theme": "airport" if is_airport else "farm",
+            "categoryLabels": ["环境", "设施", "店铺", "飞行区"] if is_airport else ["农田/牧栏", "景区", "店铺", "设施"],
+            "specialMenuLabel": "航线与客机" if is_airport else "培育与特产",
+            "challengeMenuLabel": "委托与评级" if is_airport else "竞赛与大赛",
+            "defaultCompanyName": "开罗国际机场" if is_airport else "开罗像素牧场",
+            "secretaryName": "青空美奈子" if is_airport else "牧场助手小佳"
+        },
+        "pngDims": png_dims,
+        "pngB64": png_b64,
+        "universalData": {
+            "buildItems": build_items[:48],
+            "specialItems": special_items[:24],
+            "routesOrProducts": routes_or_products[:24],
+            "challenges": challenges[:20],
+            "openingDialogs": opening_dialogs[:6],
+            "manualPages": manual_pages[:15],
+            "combos": combos[:20]
+        }
     }
 
-print("Compiled methods count:", len(compiled_methods), "String pool size:", len(string_pool))
+    raw_json = json.dumps(bundle_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    cobj = zlib.compressobj(level=9, wbits=-15)
+    deflated = cobj.compress(raw_json) + cobj.flush()
 
-# Save bundle for Node.js testing
-bundle = {
-    'strings': string_pool,
-    'jpToSc': jp_to_sc,
-    'scById': sc,
-    'methods': compiled_methods,
-    'methodSigs': method_sigs,
-    'fields': field_info,
-    'rvaBytes': rva_bytes
-}
-with open('/tmp/gds_cil_bundle.json', 'w', encoding='utf-8') as f:
-    json.dump(bundle, f, ensure_ascii=False, allow_nan=False)
-print("Saved /tmp/gds_cil_bundle.json")
+    if out_bin_path:
+        os.makedirs(os.path.dirname(os.path.abspath(out_bin_path)), exist_ok=True)
+        with open(out_bin_path, "wb") as f:
+            f.write(deflated)
+        manifest_dir = os.path.dirname(os.path.abspath(out_bin_path))
+        sub_manifest_path = os.path.join(manifest_dir, "manifest.json")
+        sub_manifest = {
+            "title": detected_title,
+            "category": "模拟经营",
+            "description": (
+                "开罗机场经营代表作。规划跑道、停机坪与航站楼商铺，购置大型客机并开通全球航线，打造世界第一的五星级国际机场。"
+                if is_airport else
+                "开罗牧场经营代表作。开垦花田与农田、饲养可爱动物、建设观光店铺并参加全国牧场竞赛，打造四季繁花的像素牧场。"
+            )
+        }
+        with open(sub_manifest_path, "w", encoding="utf-8") as f:
+            json.dump(sub_manifest, f, ensure_ascii=False, indent=2)
+        print(f"[{game_id}] Wrote {out_bin_path} ({len(deflated)/1024:.1f} KB) and {sub_manifest_path}")
+
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return bundle_payload, deflated
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Kairosoft Universal APK/ZIP -> Web Cartridge (.bin) Converter")
+    parser.add_argument("input", nargs="?", help="Input .apk, .zip, or *_Data directory path")
+    parser.add_argument("--id", default="custom_kairo_game", help="Cartridge game ID (directory name)")
+    parser.add_argument("--title", default=None, help="Optional game title override")
+    parser.add_argument("-o", "--output", default=None, help="Output .bin path (default: public/cartridges/<id>/game.bin)")
+    args = parser.parse_args()
+
+    if not args.input:
+        parser.print_help()
+        return
+
+    out_path = args.output or os.path.join("public", "cartridges", args.id, "game.bin")
+    build_universal_cartridge(args.input, args.id, out_path, args.title)
+
+
+if __name__ == "__main__":
+    main()

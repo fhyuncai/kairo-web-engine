@@ -44,7 +44,6 @@ export class FastResumeManager {
         tx.onerror = () => reject(tx.error);
       });
     } catch {
-      // Fallback to localStorage for auto slot metadata if IndexedDB is blocked in sandboxed iframe
       try {
         localStorage.setItem(`kairo_snap_${snap.id}`, JSON.stringify(snap));
       } catch {}
@@ -105,7 +104,7 @@ export class FastResumeManager {
   public exportNativeSaves(gameId: string, gameTitle: string, meta: GameRuntimeMetadata): NativeSavePackage {
     const getVfs = (key: string) => {
       try {
-        return localStorage.getItem(`kairo_vfs_${gameId}_${key}`) || localStorage.getItem(`gds_1to1_${key}`);
+        return localStorage.getItem(`kairo_vfs_${gameId}_${key}`);
       } catch {
         return null;
       }
@@ -118,26 +117,19 @@ export class FastResumeManager {
       meta,
       files: {
         sysSave: getVfs('sysSave'),
-        slot0: getVfs('save_0'),
-        slot1: getVfs('save_1')
+        slot0: getVfs('save_0')
       }
     };
   }
 
   public importNativeSaves(pkg: NativeSavePackage): void {
-    const gid = pkg.gameId || 'game_dev_story';
+    const gid = pkg.gameId || 'jumbo_airport_story';
     try {
       if (pkg.files.sysSave) {
         localStorage.setItem(`kairo_vfs_${gid}_sysSave`, pkg.files.sysSave);
-        localStorage.setItem('gds_1to1_sysSave', pkg.files.sysSave);
       }
       if (pkg.files.slot0) {
         localStorage.setItem(`kairo_vfs_${gid}_save_0`, pkg.files.slot0);
-        localStorage.setItem('gds_1to1_save_0', pkg.files.slot0);
-      }
-      if (pkg.files.slot1) {
-        localStorage.setItem(`kairo_vfs_${gid}_save_1`, pkg.files.slot1);
-        localStorage.setItem('gds_1to1_save_1', pkg.files.slot1);
       }
     } catch {}
   }

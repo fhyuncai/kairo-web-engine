@@ -208,6 +208,14 @@ export class KairoHAL {
     } catch {}
   }
 
+  public stopAudio() {
+    if (this.audioCtx && this.audioCtx.state !== 'closed') {
+      try {
+        this.audioCtx.suspend();
+      } catch {}
+    }
+  }
+
   public getStorageItem(key: string): string | null {
     const scopedKey = `kairo_vfs_${this.gameId}_${key}`;
     try {

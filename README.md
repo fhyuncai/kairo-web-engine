@@ -25,22 +25,19 @@ public/cartridges/
 ```json
 {
   "cartridges": [
-    "game_dev_story",
-    "hot_springs_story",
-    "dungeon_village"
+    "game_dev_story"
   ]
 }
 ```
 
 #### 3. 编写游戏子目录清单 `manifest.json`
-在 `public/cartridges/<game_id>/manifest.json` 中配置游戏的基本呈现信息：
+在 `public/cartridges/<game_id>/manifest.json` 中配置游戏的基本信息：
 
 ```json
 {
-  "title": "温泉物语",
+  "title": "游戏名称",
   "category": "模拟经营",
-  "resolution": [240, 284],
-  "description": "打造非凡的人气温泉旅馆，自由配置客房、小卖部和温泉，打造让客人宾至如归的知名温泉胜地。"
+  "description": "游戏相关背景与玩法描述。"
 }
 ```
 
@@ -49,8 +46,6 @@ public/cartridges/
 1. 启动项目；
 2. 点击顶栏右侧的 **「加载本地游戏」** 按钮；
 3. 选择本地的 `.bin` 游戏文件。
-
----
 
 ## 游戏转换工具
 

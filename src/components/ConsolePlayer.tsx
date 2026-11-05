@@ -18,7 +18,9 @@ interface ConsolePlayerProps {
   meta: GameRuntimeMetadata;
   latestAutoSnap: FastResumeSnapshot | null;
   simSpeed: number;
-  useOriginalFund: boolean;
+  isInfiniteFunds: boolean;
+  onToggleInfiniteFunds: () => void;
+  onOneTimeModifyFunds: (amountOrDelta: number, isDelta?: boolean) => void;
   audioEnabled: boolean;
   softLeftLabel: string;
   softRightLabel: string;
@@ -26,7 +28,6 @@ interface ConsolePlayerProps {
   onCanvasPointerDown?: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   onTriggerKey: (keyBit: number) => void;
   onSetSpeed: (speed: number) => void;
-  onToggleFund: () => void;
   onToggleAudio: () => void;
   onQuickSnapshot: () => void;
   onQuickRestore: () => void;
@@ -38,6 +39,10 @@ interface ConsolePlayerProps {
   onEndGame?: () => void;
   onSaveInGame?: () => void;
   onLoadNativeSave?: () => void;
+  // Backward compatibility
+  useOriginalFund?: boolean;
+  onToggleFund?: () => void;
+  onModifyFunds?: (amountOrMode: number | 'infinite' | 'reset' | '+50w') => void;
 }
 
 export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
@@ -48,7 +53,9 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
   meta,
   latestAutoSnap,
   simSpeed,
-  useOriginalFund,
+  isInfiniteFunds,
+  onToggleInfiniteFunds,
+  onOneTimeModifyFunds,
   audioEnabled,
   softLeftLabel,
   softRightLabel,
@@ -56,7 +63,6 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
   onCanvasPointerDown,
   onTriggerKey,
   onSetSpeed,
-  onToggleFund,
   onToggleAudio,
   onQuickSnapshot,
   onQuickRestore,
@@ -99,34 +105,36 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
     <div className="flex flex-col lg:flex-row items-center justify-center gap-6 w-full max-w-5xl mx-auto p-2 sm:p-4">
       {/* Handheld Console Unit */}
       <div className="flex flex-col items-center bg-slate-900 border-2 border-slate-700 rounded-3xl p-3 sm:p-4 shadow-2xl w-full max-w-[440px]">
-        {/* Row 1: Left: 游戏大厅, Right: 游戏功能 */}
-        <div className="w-full flex items-center justify-between gap-2 mb-2">
+        {/* Top Bar: Left: 游戏大厅, Right: [音效开关, 游戏按钮] */}
+        <div className="w-full flex items-center justify-between gap-2 mb-3">
           <button
             onClick={onReturnToHub}
-            className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-100 border border-slate-600 px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow"
+            className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-100 border border-slate-600 px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow flex items-center gap-1 cursor-pointer"
           >
-            ⬅ 游戏大厅
+            <span>⬅</span>
+            <span>游戏大厅</span>
           </button>
-          <button
-            onClick={() => setGameMenuOpen(true)}
-            className="bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-slate-950 font-extrabold px-3.5 py-1.5 rounded-xl text-xs transition-all shadow flex items-center gap-1.5"
-          >
-            🎮 游戏
-          </button>
-        </div>
-
-        {/* Row 2: 音效 */}
-        <div className="w-full mb-3">
-          <button
-            onClick={onToggleAudio}
-            className={`w-full py-1.5 rounded-xl text-xs font-bold border transition-all flex items-center justify-center gap-2 ${
-              audioEnabled
-                ? 'bg-slate-800 hover:bg-slate-700 text-slate-100 border-slate-600 shadow-sm'
-                : 'bg-slate-900 text-slate-400 border-slate-700/80 line-through decoration-red-400'
-            }`}
-          >
-            {audioEnabled ? '🔊 声音音效 (已开启)' : '🔇 声音音效 (已静音)'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onToggleAudio}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-all flex items-center gap-1.5 shadow cursor-pointer ${
+                audioEnabled
+                  ? 'bg-slate-800 hover:bg-slate-700 text-slate-100 border-slate-600'
+                  : 'bg-slate-900 text-slate-400 border-slate-700/80 line-through decoration-red-400'
+              }`}
+              title={audioEnabled ? '点击静音' : '点击开启声音'}
+            >
+              <span>{audioEnabled ? '🔊' : '🔇'}</span>
+              <span>{audioEnabled ? '音效' : '静音'}</span>
+            </button>
+            <button
+              onClick={() => setGameMenuOpen(true)}
+              className="bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-slate-950 font-extrabold px-3.5 py-1.5 rounded-xl text-xs transition-all shadow flex items-center gap-1.5 cursor-pointer"
+            >
+              <span>🎮</span>
+              <span>游戏</span>
+            </button>
+          </div>
         </div>
 
         {/* 240x284 Native Aspect Screen */}
@@ -145,27 +153,19 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
             <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center gap-3 text-amber-400 p-4 text-center z-20">
               <div className="w-9 h-9 border-4 border-amber-400 border-t-transparent rounded-full animate-spin" />
               <div className="text-sm font-bold tracking-wide">
-                {loadingText || '正在载入并解压开罗游戏卡带...'}
+                {loadingText || '正在载入并解压游戏卡带...'}
               </div>
-              <div className="text-xs text-slate-400">正在初始化 CIL 虚拟机与 1:1 图像管线</div>
             </div>
           )}
 
           {/* Standby / Center Start Game Screen */}
           {!isPlaying && !loading && (
             <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-between p-5 text-center z-20 select-none">
-              {/* Header / Brand */}
-              <div className="flex flex-col items-center gap-1.5 mt-2">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[11px] font-bold tracking-wider">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
-                  掌机硬件系统 · 待命状态
-                </div>
-                <h2 className="text-xl font-extrabold text-white tracking-wide mt-1">
+              {/* Header */}
+              <div className="flex flex-col items-center gap-1.5 mt-4">
+                <h2 className="text-xl font-extrabold text-white tracking-wide">
                   {gameTitle}
                 </h2>
-                <div className="text-[11px] text-slate-400">
-                  Game Dev Story · 开罗经典模拟经营
-                </div>
               </div>
 
               {/* Center Action Buttons */}
@@ -179,7 +179,7 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                   <span>启动游戏</span>
                 </button>
 
-                {/* 2. Fast Resume / Quick Restore Button (if latest snapshot exists) */}
+                {/* 2. Fast Resume / Restore Game Button (if latest snapshot exists) */}
                 {latestAutoSnap && (
                   <button
                     onClick={onQuickRestore}
@@ -187,31 +187,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                   >
                     <div className="flex items-center gap-1.5">
                       <span>⚡</span>
-                      <span>快速恢复现场</span>
+                      <span>恢复游戏</span>
                     </div>
                     <div className="text-[10px] text-slate-400 font-normal">
                       {latestAutoSnap.meta.dateLabel} · {latestAutoSnap.meta.fundsLabel}
                     </div>
                   </button>
                 )}
-
-                {/* 3. Load Native Save Button */}
-                {onLoadNativeSave && (
-                  <button
-                    onClick={onLoadNativeSave}
-                    className="w-full bg-slate-900/90 hover:bg-slate-800 active:scale-95 text-slate-300 border border-slate-700/80 font-semibold py-2 px-3 rounded-xl text-[11px] flex items-center justify-center gap-1.5 transition-all cursor-pointer"
-                  >
-                    <span>💾</span>
-                    <span>载入游戏原生存档</span>
-                  </button>
-                )}
-              </div>
-
-              {/* Footer specs / status */}
-              <div className="text-[10px] text-slate-500 flex items-center justify-center gap-2 pb-1">
-                <span>CIL 堆栈虚拟机</span>
-                <span>•</span>
-                <span>240×284 1:1 双倍管线</span>
               </div>
             </div>
           )}
@@ -275,13 +257,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
         {/* SoftKey Bar (2 Columns: Left Softkey, Right Softkey) */}
         <div className="w-full grid grid-cols-2 gap-2 mt-2 items-center">
           <button
-            onClick={() => onTriggerKey(2097152)}
+            onClick={() => isPlaying && onTriggerKey(2097152)}
             className="bg-slate-800 active:bg-slate-950 hover:bg-slate-750 text-amber-300 border border-slate-600 py-2 rounded-xl text-xs font-bold shadow-sm transition-all text-center"
           >
             {softLeftLabel || '存档'}
           </button>
           <button
-            onClick={() => onTriggerKey(4194304)}
+            onClick={() => isPlaying && onTriggerKey(4194304)}
             className="bg-slate-800 active:bg-slate-950 hover:bg-slate-750 text-amber-300 border border-slate-600 py-2 rounded-xl text-xs font-bold shadow-sm transition-all text-center"
           >
             {softRightLabel || '菜单 / 返回'}
@@ -294,33 +276,33 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
           <div className="grid grid-cols-3 gap-1.5 w-36 h-36">
             <div />
             <button
-              onClick={() => onTriggerKey(131072)}
+              onClick={() => isPlaying && onTriggerKey(131072)}
               className="bg-slate-800 active:bg-amber-500 active:text-slate-950 border border-slate-600 rounded-lg font-extrabold text-xs shadow-sm"
             >
               上
             </button>
             <div />
             <button
-              onClick={() => onTriggerKey(65536)}
+              onClick={() => isPlaying && onTriggerKey(65536)}
               className="bg-slate-800 active:bg-amber-500 active:text-slate-950 border border-slate-600 rounded-lg font-extrabold text-xs shadow-sm"
             >
               左
             </button>
             <button
-              onClick={() => (isPlaying ? onTriggerKey(1048576) : onStartGame?.())}
+              onClick={() => isPlaying && onTriggerKey(1048576)}
               className="bg-amber-500 active:bg-amber-400 text-slate-950 rounded-lg font-extrabold text-xs shadow"
             >
               确定
             </button>
             <button
-              onClick={() => onTriggerKey(262144)}
+              onClick={() => isPlaying && onTriggerKey(262144)}
               className="bg-slate-800 active:bg-amber-500 active:text-slate-950 border border-slate-600 rounded-lg font-extrabold text-xs shadow-sm"
             >
               右
             </button>
             <div />
             <button
-              onClick={() => onTriggerKey(524288)}
+              onClick={() => isPlaying && onTriggerKey(524288)}
               className="bg-slate-800 active:bg-amber-500 active:text-slate-950 border border-slate-600 rounded-lg font-extrabold text-xs shadow-sm"
             >
               下
@@ -332,13 +314,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
           <div className="flex-1 flex flex-col gap-2">
             <div className="grid grid-cols-2 gap-2">
               <button
-                onClick={() => (isPlaying ? onTriggerKey(1048576) : onStartGame?.())}
+                onClick={() => isPlaying && onTriggerKey(1048576)}
                 className="bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-slate-950 font-extrabold py-3.5 rounded-2xl text-sm shadow-md"
               >
                 确定
               </button>
               <button
-                onClick={() => onTriggerKey(4194304)}
+                onClick={() => isPlaying && onTriggerKey(4194304)}
                 className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-100 border border-slate-600 font-extrabold py-3.5 rounded-2xl text-sm shadow-sm"
               >
                 返回 / 菜单
@@ -346,13 +328,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button
-                onClick={() => onTriggerKey(65536)}
+                onClick={() => isPlaying && onTriggerKey(65536)}
                 className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 border border-slate-600 font-bold py-2.5 rounded-xl text-xs shadow-sm"
               >
                 ◀ 上一页
               </button>
               <button
-                onClick={() => onTriggerKey(262144)}
+                onClick={() => isPlaying && onTriggerKey(262144)}
                 className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-slate-200 border border-slate-600 font-bold py-2.5 rounded-xl text-xs shadow-sm"
               >
                 下一页 ▶
@@ -379,7 +361,7 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
 
               {/* 1. 运行倍速 */}
               <div className="flex flex-col gap-1.5">
-                <div className="text-xs font-bold text-slate-400">⚡ 游戏运行倍速</div>
+                <div className="text-xs font-bold text-slate-400">运行倍速</div>
                 <div className="grid grid-cols-3 gap-2">
                   {[1, 2, 4].map(sp => (
                     <button
@@ -397,40 +379,69 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                 </div>
               </div>
 
-              {/* 2. 资金模式 */}
-              <div className="flex flex-col gap-1.5">
-                <div className="text-xs font-bold text-slate-400">💰 初始资金设定</div>
-                <div className="grid grid-cols-2 gap-2">
+              {/* 2. 资金修改 */}
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between text-xs font-bold">
+                  <span className="text-slate-400">资金修改</span>
+                  <span className="text-amber-400 font-extrabold">{meta.fundsLabel || '5,000币'}</span>
+                </div>
+
+                {/* 持续模式：无限资金 (默认关，不用 primary 样式) */}
+                <div className="flex items-center justify-between bg-slate-950/60 border border-slate-800 rounded-xl px-3 py-2.5">
+                  <div className="flex flex-col gap-0.5">
+                    <div className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                      <span>💎</span>
+                      <span>无限资金</span>
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      持续锁定 9999万
+                    </div>
+                  </div>
                   <button
-                    onClick={() => {
-                      if (!useOriginalFund) onToggleFund();
-                    }}
-                    className={`py-2 rounded-xl text-xs font-bold border transition-all ${
-                      useOriginalFund
-                        ? 'bg-amber-500 text-slate-950 border-amber-300 font-extrabold shadow-md'
-                        : 'bg-slate-800 text-slate-200 border-slate-700 hover:bg-slate-750'
+                    type="button"
+                    onClick={onToggleInfiniteFunds}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                      isInfiniteFunds
+                        ? 'bg-slate-800 text-emerald-400 border-emerald-500/60 hover:bg-slate-750'
+                        : 'bg-slate-800 text-slate-400 border-slate-700 hover:text-slate-200 hover:bg-slate-750'
                     }`}
                   >
-                    💰 原版 5,000币
+                    {isInfiniteFunds ? '已开启' : '已关闭'}
                   </button>
-                  <button
-                    onClick={() => {
-                      if (useOriginalFund) onToggleFund();
-                    }}
-                    className={`py-2 rounded-xl text-xs font-bold border transition-all ${
-                      !useOriginalFund
-                        ? 'bg-amber-500 text-slate-950 border-amber-300 font-extrabold shadow-md'
-                        : 'bg-slate-800 text-slate-200 border-slate-700 hover:bg-slate-750'
-                    }`}
-                  >
-                    💎 无限资金 (9999万)
-                  </button>
+                </div>
+
+                {/* 一次性修改 */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onOneTimeModifyFunds(10000, true)}
+                      className="bg-slate-800 hover:bg-slate-750 active:bg-slate-900 text-slate-200 border border-slate-700 py-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <span>+1万</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const input = prompt('请输入想要修改的目标资金数额（一次性设定，单位：币）：', String(meta.funds || 5000));
+                        if (input !== null && input.trim() !== '') {
+                          const val = parseInt(input.replace(/[^0-9]/g, ''), 10);
+                          if (!isNaN(val)) {
+                            onOneTimeModifyFunds(val, false);
+                          }
+                        }
+                      }}
+                      className="bg-slate-800 hover:bg-slate-750 active:bg-slate-900 text-slate-200 border border-slate-700 py-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <span>自定义</span>
+                    </button>
+                  </div>
                 </div>
               </div>
 
               {/* 3. FastResume 快捷现场 (快照/恢复) */}
               <div className="flex flex-col gap-1.5">
-                <div className="text-xs font-bold text-slate-400">⚡ 瞬时现场暂存 (FastResume)</div>
+                <div className="text-xs font-bold text-slate-400">游戏快照</div>
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={() => {
@@ -439,7 +450,7 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                     }}
                     className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-1.5 shadow transition-colors"
                   >
-                    ⚡ 快速快照现场
+                    保存快照
                   </button>
                   <button
                     onClick={() => {
@@ -448,14 +459,14 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                     }}
                     className="bg-emerald-950/80 hover:bg-emerald-900 text-emerald-200 border border-emerald-600/50 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors"
                   >
-                    ↺ 恢复最近快照
+                    恢复快照
                   </button>
                 </div>
               </div>
 
               {/* 4. 原生存档操作 */}
               <div className="flex flex-col gap-1.5">
-                <div className="text-xs font-bold text-slate-400">💾 游戏内置原生存档</div>
+                <div className="text-xs font-bold text-slate-400">游戏内置存档</div>
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={() => {
@@ -464,7 +475,7 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                     }}
                     className="bg-amber-600 hover:bg-amber-500 active:bg-amber-700 text-slate-950 font-extrabold py-2.5 rounded-xl text-xs flex items-center justify-center gap-1.5 shadow transition-colors"
                   >
-                    💾 写入当前存档
+                    保存游戏
                   </button>
                   <button
                     onClick={() => {
@@ -473,13 +484,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                     }}
                     className="bg-slate-800 hover:bg-slate-700 active:bg-slate-900 text-amber-300 border border-amber-500/50 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors"
                   >
-                    ⚡ 读取原生存档
+                    读取存档
                   </button>
                 </div>
               </div>
 
               {/* 5. 存档管理与导入导出 */}
-              <div className="flex flex-col gap-1.5 pt-1 border-t border-slate-800">
+              <div className="flex flex-col gap-1.5">
                 <button
                   onClick={() => {
                     setGameMenuOpen(false);
@@ -487,12 +498,12 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                   }}
                   className="w-full bg-indigo-900/80 hover:bg-indigo-800 active:bg-indigo-950 text-indigo-100 border border-indigo-500/50 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 shadow transition-colors"
                 >
-                  📂 打开存档管理器 (导出/导入/快照列表)
+                  存档管理器
                 </button>
               </div>
 
               {/* 6. 重新启动游戏 */}
-              <div className="flex flex-col gap-1.5 pt-1 border-t border-slate-800">
+              <div className="flex flex-col gap-1.5">
                 <button
                   onClick={() => {
                     setGameMenuOpen(false);
@@ -500,13 +511,13 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                   }}
                   className="w-full bg-rose-950/70 hover:bg-rose-900 active:bg-rose-950 text-rose-200 border border-rose-700/60 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 shadow transition-colors cursor-pointer"
                 >
-                  🔄 完整重启虚拟机 (重置内存并重新运行)
+                  重启游戏
                 </button>
               </div>
 
               {/* 7. 结束游戏回到启动屏 */}
               {onEndGame && (
-                <div className="flex flex-col gap-1.5 pt-1 border-t border-slate-800">
+                <div className="flex flex-col gap-1.5">
                   <button
                     onClick={() => {
                       setGameMenuOpen(false);
@@ -514,17 +525,10 @@ export const ConsolePlayer: React.FC<ConsolePlayerProps> = ({
                     }}
                     className="w-full bg-amber-950/70 hover:bg-amber-900 active:bg-amber-950 text-amber-200 border border-amber-600/50 font-bold py-2.5 rounded-xl text-xs flex items-center justify-center gap-2 shadow transition-colors cursor-pointer"
                   >
-                    🛑 结束当前游戏 (停机待命回到启动界面)
+                    结束游戏
                   </button>
                 </div>
               )}
-
-              <button
-                onClick={() => setGameMenuOpen(false)}
-                className="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-2 rounded-xl text-xs mt-1 transition-colors"
-              >
-                关闭菜单
-              </button>
             </div>
           </div>
         )}

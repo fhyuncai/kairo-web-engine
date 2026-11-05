@@ -352,7 +352,12 @@ export class CilVM {
     };
     this.execMethod(100669211, storey, [ok ? 1 : 0]);
     if (ok && pm === 1) {
-      this.staticFields['form.GameForm::Shikin'] = this.useOriginalFund ? 5000 : 99999999;
+      const curShikin = this.staticFields['form.GameForm::Shikin'];
+      if (curShikin !== undefined && curShikin !== null && curShikin !== 5000) {
+        // 保留玩家已修改的自定义或无限资金
+      } else {
+        this.staticFields['form.GameForm::Shikin'] = this.useOriginalFund ? 5000 : 99999999;
+      }
       this.staticFields['form.GameForm::pushIntro_'] = 0;
     }
     this.hal.playTone(ok ? 720 : 340, 0.06);

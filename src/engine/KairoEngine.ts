@@ -17,6 +17,7 @@ export class KairoEngine {
   public simSpeed = 1;
   public audioEnabled = true;
   public useOriginalFund = true;
+  public isInfiniteFunds = false;
   public isNamingModalOpen = false;
 
   private isRunning = false;
@@ -121,6 +122,11 @@ export class KairoEngine {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;
     }
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+    this.hal.stopAudio();
   }
 
   public renderFrame() {
@@ -170,6 +176,9 @@ export class KairoEngine {
   }
 
   public stepSingleUpdate() {
+    if (this.isInfiniteFunds) {
+      this.vm.staticFields['form.GameForm::Shikin'] = 99999999;
+    }
     const top = this.vm.getTopForm();
     if (!top) return;
     this.vm.fm.currentForm_ = top;
@@ -334,15 +343,52 @@ export class KairoEngine {
     this.simSpeed = Math.max(1, speed);
   }
 
-  public toggleFund() {
-    this.useOriginalFund = !this.useOriginalFund;
-    this.vm.useOriginalFund = this.useOriginalFund;
-    if (!this.useOriginalFund) {
+  public setInfiniteFunds(enabled: boolean) {
+    this.isInfiniteFunds = enabled;
+    this.useOriginalFund = !enabled;
+    this.vm.useOriginalFund = !enabled;
+    if (enabled) {
       this.vm.staticFields['form.GameForm::Shikin'] = 99999999;
-    } else {
-      this.vm.staticFields['form.GameForm::Shikin'] = 5000;
     }
     this.updateMeta();
+    this.renderFrame();
+    this.hal.playTone(enabled ? 880 : 440, 0.08);
+  }
+
+  public modifyFundsOnce(amountOrDelta: number, isDelta = false) {
+    this.isInfiniteFunds = false;
+    this.useOriginalFund = true;
+    this.vm.useOriginalFund = true;
+
+    const current = Number(this.vm.staticFields['form.GameForm::Shikin'] ?? 5000);
+    const target = isDelta ? current + amountOrDelta : amountOrDelta;
+    const clamped = Math.min(99999999, Math.max(0, Math.floor(target)));
+
+    this.vm.staticFields['form.GameForm::Shikin'] = clamped;
+    this.updateMeta();
+    this.renderFrame();
+    this.hal.playTone(720, 0.08);
+    return clamped;
+  }
+
+  public modifyFunds(amountOrMode: number | 'infinite' | 'reset' | 'off') {
+    if (amountOrMode === 'infinite') {
+      this.setInfiniteFunds(true);
+      return 99999999;
+    } else if (amountOrMode === 'reset' || amountOrMode === 'off') {
+      return this.modifyFundsOnce(5000, false);
+    } else if (typeof amountOrMode === 'number' && !isNaN(amountOrMode)) {
+      return this.modifyFundsOnce(amountOrMode, false);
+    }
+    return this.modifyFundsOnce(5000, false);
+  }
+
+  public addFunds(delta: number) {
+    return this.modifyFundsOnce(delta, true);
+  }
+
+  public toggleFund() {
+    this.setInfiniteFunds(!this.isInfiniteFunds);
   }
 
   public toggleAudio() {
@@ -407,7 +453,8 @@ export class KairoEngine {
     const engineSettings = {
       simSpeed: this.simSpeed,
       audioEnabled: this.audioEnabled ? 1 : 0,
-      useOriginalFund: this.useOriginalFund
+      useOriginalFund: this.useOriginalFund,
+      isInfiniteFunds: this.isInfiniteFunds
     };
 
     const snap: FastResumeSnapshot = {
@@ -471,8 +518,13 @@ export class KairoEngine {
         this.audioEnabled = !!snap.engineSettings.audioEnabled;
         this.hal.audioEnabled = this.audioEnabled;
       }
-      if (typeof snap.engineSettings.useOriginalFund === 'boolean') {
+      if (typeof snap.engineSettings.isInfiniteFunds === 'boolean') {
+        this.isInfiniteFunds = snap.engineSettings.isInfiniteFunds;
+        this.useOriginalFund = !this.isInfiniteFunds;
+        this.vm.useOriginalFund = this.useOriginalFund;
+      } else if (typeof snap.engineSettings.useOriginalFund === 'boolean') {
         this.useOriginalFund = snap.engineSettings.useOriginalFund;
+        this.isInfiniteFunds = !this.useOriginalFund;
         this.vm.useOriginalFund = this.useOriginalFund;
       }
     }
@@ -486,6 +538,8 @@ export class KairoEngine {
 
   public rebootVM() {
     this.stop();
+    this.isInfiniteFunds = false;
+    this.useOriginalFund = true;
     if (this.settleTimer) {
       clearTimeout(this.settleTimer);
       this.settleTimer = null;

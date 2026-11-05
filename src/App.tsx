@@ -62,7 +62,7 @@ async function scanCartridges(): Promise<CartridgeManifestItem[]> {
   const items: CartridgeManifestItem[] = [];
 
   for (const id of ids) {
-    // 自动扫描对应目录的 manifest.json (及兼容 manifast.json)
+    // 自动扫描对应目录的 manifest.json
     let manifestData: Partial<CartridgeManifestItem> | null = null;
     try {
       let mRes = await fetch(`/cartridges/${id}/manifest.json`);
@@ -81,36 +81,11 @@ async function scanCartridges(): Promise<CartridgeManifestItem[]> {
       hasBin = await checkFileExists('/cartridges/game_dev_story.kairo.bin');
     }
 
-    const KNOWN_GAMES: Record<string, { title: string; category: string; desc: string }> = {
-      game_dev_story: {
-        title: '游戏发展国',
-        category: '模拟经营',
-        desc: '开罗游戏殿堂级代表作。从零创立游戏开发社，搭配类型与内容、培养全能员工、研发次世代主机，斩获百万销量与年度最佳游戏大奖。'
-      },
-      hot_springs_story: {
-        title: '温泉物语',
-        category: '模拟经营',
-        desc: '将转换后的 game.bin 放入 public/cartridges/hot_springs_story/ 目录即可直接启动运行。'
-      },
-      dungeon_village: {
-        title: '冒险村物语',
-        category: 'RPG / 经营',
-        desc: '将转换后的 game.bin 放入 public/cartridges/dungeon_village/ 目录即可直接启动运行。'
-      }
-    };
-
-    const fallback = KNOWN_GAMES[id] || {
-      title: id,
-      category: '模拟经营',
-      desc: `请将 game.bin 放入 public/cartridges/${id}/ 目录。`
-    };
-
     items.push({
       id,
-      title: manifestData?.title || fallback.title,
-      category: manifestData?.category || fallback.category,
-      resolution: manifestData?.resolution || [240, 284],
-      description: manifestData?.description || fallback.desc,
+      title: manifestData?.title || id,
+      category: manifestData?.category || '',
+      description: manifestData?.description || '',
       hasBin
     });
   }
@@ -118,15 +93,41 @@ async function scanCartridges(): Promise<CartridgeManifestItem[]> {
   return items;
 }
 
+function parseRouteFromHash(): { view: 'hub' | 'player'; gameId: string } {
+  const hash = window.location.hash.replace(/^#\/?/, '').trim();
+  const clean = hash.split('?')[0].trim();
+  if (!clean || clean === 'hub' || clean === 'lobby') {
+    return { view: 'hub', gameId: '' };
+  }
+  return { view: 'player', gameId: clean };
+}
+
 export default function App() {
-  const [view, setView] = useState<'player' | 'hub'>('hub');
+  const initialRoute = parseRouteFromHash();
+  const [view, setView] = useState<'player' | 'hub'>(initialRoute.view);
   const [isPlaying, setIsPlaying] = useState(false);
   const [cartridges, setCartridges] = useState<CartridgeManifestItem[]>([]);
   const [snapshots, setSnapshots] = useState<FastResumeSnapshot[]>([]);
   const [autoSnapshotsMap, setAutoSnapshotsMap] = useState<Record<string, FastResumeSnapshot | undefined>>({});
-  const [currentGameId, setCurrentGameId] = useState('game_dev_story');
-  const [currentGameTitle, setCurrentGameTitle] = useState('游戏发展国');
+  const [currentGameId, setCurrentGameId] = useState(initialRoute.gameId || 'game_dev_story');
+  const [currentGameTitle, setCurrentGameTitle] = useState(initialRoute.gameId || '游戏发展国');
   const [saveModalOpen, setSaveModalOpen] = useState(false);
+
+  const viewRef = useRef<'player' | 'hub'>(initialRoute.view);
+  const isPlayingRef = useRef<boolean>(false);
+  const currentGameIdRef = useRef<string>(initialRoute.gameId || 'game_dev_story');
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    currentGameIdRef.current = currentGameId;
+  }, [currentGameId]);
 
   const [loading, setLoading] = useState(true);
   const [loadingText, setLoadingText] = useState('正在读取游戏卡带...');
@@ -134,6 +135,7 @@ export default function App() {
   const [meta, setMeta] = useState<GameRuntimeMetadata>(DEFAULT_META);
   const [simSpeed, setSimSpeed] = useState(1);
   const [useOriginalFund, setUseOriginalFund] = useState(true);
+  const [isInfiniteFunds, setIsInfiniteFunds] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [softLeftLabel, setSoftLeftLabel] = useState('存档');
   const [softRightLabel, setSoftRightLabel] = useState('菜单');
@@ -174,6 +176,10 @@ export default function App() {
       const decompressed = inflateRaw(new Uint8Array(arrayBuf));
       const jsonStr = new TextDecoder('utf-8').decode(decompressed);
       const bundle: CartridgeBundle = JSON.parse(jsonStr);
+
+      if (bundle.meta?.title) {
+        setCurrentGameTitle(bundle.meta.title);
+      }
 
       setLoadingText('正在启动虚拟硬件层与 CIL 运行时...');
       const canvas = canvasRef.current || (document.getElementById('kairo-canvas') as HTMLCanvasElement);
@@ -236,10 +242,76 @@ export default function App() {
         if (snaps[0]) map[it.id] = snaps[0];
       }
       setAutoSnapshotsMap(map);
-      const curSnaps = await resumeMgr.listSnapshots('game_dev_story');
+
+      const targetId = currentGameIdRef.current;
+      const curSnaps = await resumeMgr.listSnapshots(targetId);
       setSnapshots(curSnaps);
+
+      const curCart = items.find(it => it.id === targetId);
+      if (curCart) {
+        setCurrentGameTitle(curCart.title);
+      }
     });
   }, []);
+
+  // Normalize initial empty hash to /#/
+  useEffect(() => {
+    if (!window.location.hash || window.location.hash === '#') {
+      window.location.hash = '/';
+    }
+  }, []);
+
+  // Listen to browser hash changes (back/forward or manual hash change)
+  useEffect(() => {
+    const handleHashChange = async () => {
+      const route = parseRouteFromHash();
+      if (route.view === 'hub') {
+        if (viewRef.current !== 'hub') {
+          if (engineRef.current) {
+            if (isPlayingRef.current) {
+              try {
+                const top = engineRef.current.vm.getTopForm();
+                if (top && top.__type !== 'form.TitleForm' && top !== engineRef.current.vm.tf) {
+                  await engineRef.current.triggerEventSnapshot('返回大厅自动保存现场', 'auto');
+                  await refreshSnapshots(currentGameIdRef.current);
+                }
+              } catch (e) {
+                console.warn(e);
+              }
+            }
+            engineRef.current.stop();
+            engineRef.current.rebootVM();
+          }
+          setIsPlaying(false);
+          setView('hub');
+        }
+      } else {
+        // Player route: /#/game_id
+        const targetId = route.gameId;
+        if (targetId) {
+          setCurrentGameId(targetId);
+          const cart = cartridges.find(c => c.id === targetId);
+          if (cart) {
+            setCurrentGameTitle(cart.title);
+          }
+          setView('player');
+          refreshSnapshots(targetId);
+
+          if (!engineRef.current || engineRef.current.gameId !== targetId) {
+            if (engineRef.current) {
+              engineRef.current.stop();
+              engineRef.current.rebootVM();
+            }
+            setIsPlaying(false);
+            await loadCartridge(targetId);
+          }
+        }
+      }
+    };
+
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, [cartridges, loadCartridge, refreshSnapshots]);
 
   // Pre-initialize initial cartridge when canvas is ready
   useEffect(() => {
@@ -247,7 +319,8 @@ export default function App() {
 
     let isMounted = true;
     const timer = setTimeout(async () => {
-      const eng = await loadCartridge('game_dev_story');
+      const targetId = currentGameIdRef.current;
+      const eng = await loadCartridge(targetId);
       if (!isMounted || !eng) return;
 
       if (pendingRestoreSnapRef.current) {
@@ -278,10 +351,6 @@ export default function App() {
       if (!eng || saveModalOpen || namingModalInfo?.isOpen) return;
 
       if (!isPlaying) {
-        if (e.code === 'Enter' || e.code === 'Space') {
-          e.preventDefault();
-          handleStartGame();
-        }
         return;
       }
 
@@ -338,6 +407,7 @@ export default function App() {
   };
 
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isPlaying) return;
     if (engineRef.current) {
       engineRef.current.handleCanvasPointerDown(
         e.clientX,
@@ -362,6 +432,7 @@ export default function App() {
   };
 
   const handleTriggerKey = (keyBit: number) => {
+    if (!isPlaying) return;
     if (engineRef.current) {
       engineRef.current.triggerKey(keyBit);
     }
@@ -374,11 +445,41 @@ export default function App() {
     }
   };
 
-  const handleToggleFund = () => {
-    if (engineRef.current) {
-      engineRef.current.toggleFund();
-      setUseOriginalFund(engineRef.current.useOriginalFund);
+  const handleToggleInfiniteFunds = () => {
+    if (!engineRef.current) return;
+    const next = !isInfiniteFunds;
+    engineRef.current.setInfiniteFunds(next);
+    setIsInfiniteFunds(next);
+    setUseOriginalFund(!next);
+    setMeta(engineRef.current.extractMetadata());
+  };
+
+  const handleOneTimeModifyFunds = (amountOrDelta: number, isDelta = false) => {
+    if (!engineRef.current) return;
+    engineRef.current.modifyFundsOnce(amountOrDelta, isDelta);
+    setIsInfiniteFunds(false);
+    setUseOriginalFund(true);
+    setMeta(engineRef.current.extractMetadata());
+  };
+
+  const handleModifyFunds = (amountOrMode: number | 'infinite' | 'reset' | '+50w') => {
+    if (!engineRef.current) return;
+    if (amountOrMode === '+50w') {
+      handleOneTimeModifyFunds(500000, true);
+    } else if (amountOrMode === 'infinite') {
+      engineRef.current.setInfiniteFunds(true);
+      setIsInfiniteFunds(true);
+      setUseOriginalFund(false);
+    } else if (amountOrMode === 'reset') {
+      handleOneTimeModifyFunds(5000, false);
+    } else if (typeof amountOrMode === 'number') {
+      handleOneTimeModifyFunds(amountOrMode, false);
     }
+    setMeta(engineRef.current.extractMetadata());
+  };
+
+  const handleToggleFund = () => {
+    handleToggleInfiniteFunds();
   };
 
   const handleToggleAudio = () => {
@@ -389,14 +490,17 @@ export default function App() {
   };
 
   const handleQuickSnapshot = async () => {
-    if (!engineRef.current) return;
+    if (!isPlaying || !engineRef.current) {
+      alert('游戏未在运行中，无法保存快照');
+      return;
+    }
     const snap = await engineRef.current.triggerEventSnapshot('玩家手动快捷快照', 'manual');
-    await refreshSnapshots();
+    await refreshSnapshots(currentGameId);
     alert(`⚡ 快速快照保存成功！\n时间：${snap.meta.dateLabel} · 场景：${snap.meta.sceneLabel}`);
   };
 
   const handleQuickRestore = async () => {
-    const gid = engineRef.current ? engineRef.current.gameId : 'game_dev_story';
+    const gid = engineRef.current ? engineRef.current.gameId : currentGameIdRef.current;
     const all = await resumeMgr.listSnapshots(gid);
     const latest = all[0];
     if (!latest) {
@@ -404,29 +508,52 @@ export default function App() {
       return;
     }
     setView('player');
+    if (window.location.hash !== `#/${gid}`) {
+      window.location.hash = `/${gid}`;
+    }
     if (engineRef.current) {
       await engineRef.current.restoreSnapshot(latest);
       setIsPlaying(true);
-      alert(`⚡ 快照现场已恢复！\n时间：${latest.meta.dateLabel} · 场景：${latest.meta.sceneLabel}`);
+      if (typeof latest.engineSettings?.isInfiniteFunds === 'boolean') {
+        setIsInfiniteFunds(latest.engineSettings.isInfiniteFunds);
+        setUseOriginalFund(!latest.engineSettings.isInfiniteFunds);
+      } else if (typeof latest.engineSettings?.useOriginalFund === 'boolean') {
+        setIsInfiniteFunds(!latest.engineSettings.useOriginalFund);
+        setUseOriginalFund(latest.engineSettings.useOriginalFund);
+      }
+      alert(`快照已恢复\n时间：${latest.meta.dateLabel} · 场景：${latest.meta.sceneLabel}`);
     } else {
       pendingRestoreSnapRef.current = latest;
     }
   };
 
   const handleCaptureManualSnapshot = async () => {
-    if (!engineRef.current) return;
+    if (!isPlaying || !engineRef.current) {
+      alert('游戏未在运行中，无法保存快照');
+      return;
+    }
     await engineRef.current.triggerEventSnapshot('用户手动存档槽位', 'manual');
-    await refreshSnapshots();
+    await refreshSnapshots(currentGameId);
     alert('📸 新建当前状态快照成功！');
   };
 
   const handleRestoreSnapshot = async (snap: FastResumeSnapshot) => {
     setSaveModalOpen(false);
     setView('player');
+    if (window.location.hash !== `#/${snap.gameId}`) {
+      window.location.hash = `/${snap.gameId}`;
+    }
     if (engineRef.current) {
       await engineRef.current.restoreSnapshot(snap);
       setIsPlaying(true);
-      alert(`⚡ 已恢复至现场：${snap.meta.dateLabel} (${snap.meta.sceneLabel})`);
+      if (typeof snap.engineSettings?.isInfiniteFunds === 'boolean') {
+        setIsInfiniteFunds(snap.engineSettings.isInfiniteFunds);
+        setUseOriginalFund(!snap.engineSettings.isInfiniteFunds);
+      } else if (typeof snap.engineSettings?.useOriginalFund === 'boolean') {
+        setIsInfiniteFunds(!snap.engineSettings.useOriginalFund);
+        setUseOriginalFund(snap.engineSettings.useOriginalFund);
+      }
+      alert(`快照已恢复：${snap.meta.dateLabel} (${snap.meta.sceneLabel})`);
     } else {
       pendingRestoreSnapRef.current = snap;
     }
@@ -434,13 +561,24 @@ export default function App() {
 
   const handleRestartGame = () => {
     if (!engineRef.current) return;
-    if (confirm('确定要完整重启虚拟机吗？\n将彻底清除当前内存并重置硬件系统。已保存的原生存档与快照将完整保留。')) {
-      engineRef.current.restartGame();
-      setIsPlaying(true);
+    if (confirm('确定要重启游戏吗？')) {
+      engineRef.current.rebootVM();
+      setIsInfiniteFunds(false);
+      setUseOriginalFund(true);
+      if (isPlaying) {
+        engineRef.current.start();
+        setIsPlaying(true);
+      } else {
+        setIsPlaying(false);
+      }
     }
   };
 
   const handleSaveInGame = () => {
+    if (!isPlaying) {
+      alert('游戏未在运行中，无法写入当前存档');
+      return;
+    }
     if (engineRef.current) {
       engineRef.current.saveInGame(true);
     }
@@ -449,6 +587,9 @@ export default function App() {
   const handleLoadNativeSave = () => {
     setSaveModalOpen(false);
     setView('player');
+    if (window.location.hash !== `#/${currentGameIdRef.current}`) {
+      window.location.hash = `/${currentGameIdRef.current}`;
+    }
     if (engineRef.current) {
       const ok = engineRef.current.loadNativeSave();
       if (ok) setIsPlaying(true);
@@ -464,6 +605,9 @@ export default function App() {
     }
     setCurrentGameId(id);
     setView('player');
+    if (window.location.hash !== `#/${id}`) {
+      window.location.hash = `/${id}`;
+    }
 
     let eng = engineRef.current;
     if (!eng || eng.gameId !== id) {
@@ -489,21 +633,26 @@ export default function App() {
 
   const handleReturnToHub = async () => {
     if (engineRef.current) {
-      if (isPlaying) {
+      if (isPlayingRef.current) {
         try {
           const top = engineRef.current.vm.getTopForm();
           if (top && top.__type !== 'form.TitleForm' && top !== engineRef.current.vm.tf) {
             await engineRef.current.triggerEventSnapshot('返回大厅自动保存现场', 'auto');
-            await refreshSnapshots(currentGameId);
+            await refreshSnapshots(currentGameIdRef.current);
           }
         } catch (e) {
           console.warn('Auto exit snapshot error on return to hub:', e);
         }
       }
+      // 真正关闭游戏：停止渲染循环与音频，重置虚拟机内存至初始状态
       engineRef.current.stop();
+      engineRef.current.rebootVM();
     }
     setIsPlaying(false);
     setView('hub');
+    if (window.location.hash !== '#/' && window.location.hash !== '') {
+      window.location.hash = '/';
+    }
   };
 
   const handleUploadCartridge = async (file: File) => {
@@ -528,6 +677,9 @@ export default function App() {
       const gtitle = bundle.meta?.title || file.name.replace(/\.bin$/i, '');
       setCurrentGameId(gid);
       setCurrentGameTitle(gtitle);
+      if (window.location.hash !== `#/${gid}`) {
+        window.location.hash = `/${gid}`;
+      }
 
       if (engineRef.current) {
         engineRef.current.stop();
@@ -657,6 +809,9 @@ export default function App() {
           meta={meta}
           latestAutoSnap={autoSnapshotsMap[currentGameId] || snapshots[0] || null}
           simSpeed={simSpeed}
+          isInfiniteFunds={isInfiniteFunds}
+          onToggleInfiniteFunds={handleToggleInfiniteFunds}
+          onOneTimeModifyFunds={handleOneTimeModifyFunds}
           useOriginalFund={useOriginalFund}
           audioEnabled={audioEnabled}
           softLeftLabel={softLeftLabel}
@@ -674,6 +829,7 @@ export default function App() {
           onTriggerKey={handleTriggerKey}
           onSetSpeed={handleSetSpeed}
           onToggleFund={handleToggleFund}
+          onModifyFunds={handleModifyFunds}
           onToggleAudio={handleToggleAudio}
           onQuickSnapshot={handleQuickSnapshot}
           onQuickRestore={handleQuickRestore}

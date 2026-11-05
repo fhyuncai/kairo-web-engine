@@ -2,7 +2,6 @@ export interface CartridgeManifestItem {
   id: string;
   title: string;
   category?: string;
-  resolution?: [number, number];
   description?: string;
   hasBin?: boolean;
 }
@@ -60,6 +59,7 @@ export interface FastResumeSnapshot {
     simSpeed: number;
     audioEnabled: number | boolean;
     useOriginalFund: boolean;
+    isInfiniteFunds?: boolean;
   };
   vmState: {
     version: number;
